@@ -78,6 +78,8 @@ const ALLOWLISTED_ACRONYMS = [
   'LLP',
   'LP',
   'PLC',
+  'Class A',
+  'Class B',
 ];
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -839,7 +841,7 @@ function auditCashOutflowSigns(ticker, sheets) {
   }
 
   const exclusionRegex =
-    /순증감|증감|유입|처분|매각및|사업매각|만기도래|원금회수|만기회수|조기상환|만기상환|회수|조정|수익|미지급|^\[|proceeds|net\s+change|increase|decrease|issuance|sale\s+of|maturities|collections|accrued|payable|beginning|end\s+of/i;
+    /순증감|증감|유입|처분|매각및|사업매각|만기도래|원금회수|만기회수|조기상환|만기상환|회수|조정|수익|미지급|^\[.*\]$|proceeds|net\s+change|increase|decrease|issuance|sale\s+of|maturities|collections|accrued|payable|beginning|end\s+of/i;
   const outflowRegex =
     /(?:CAPEX|자본적\s*지출|유형자산의?\s*(?:취득|매입)|생산설비(?:자산)?의?\s*취득|무형자산의?\s*취득|배당금의?\s*지급|현금배당(?:금)?\s*지급|자사주\s*매입|자기주식의?\s*(?:취득|매입)|(?:채무증권|지분증권|유가증권|단기금융상품|투자자산|대출채권|리스채권|비지배지분).*?(?:취득|매입)|기업인수로\s*인한\s*현금유출|관련\s*현금유출|(?:차입금|사채|부채|리스부채|우선주).*?상환|상환에\s*따른\s*현금유출|원천징수세액\s*납부|이연금융원가의?\s*지급|^(?:purchases?\s+of|additions?\s+to|capital\s+expenditures?|payments?\s+(?:to\s+acquire|for\s+repurchase|of\s+dividends|for\s+dividends|on\s+long-?term\s+debt|on\s+.*lease)|repayments?\s+of|repurchases?\s+of|common\s+stock\s+repurchased|treasury\s+stock\s+purchases?|acquisitions?,?\s*net\s+of\s+cash|business\s+acquisitions?|cash\s+dividends\s+paid|dividends\s+paid|redemption\s+of|retirement\s+of)|\bcapital\s+expenditures?\b|\bdividends?\s+paid\b|\brepurchases?\s+of\s+(?:common|treasury|capital)\s+stock\b)/i;
 
@@ -944,6 +946,235 @@ function auditUntranslatedLabels(ticker, sheets) {
   };
 }
 
+// [검증 6] BRK-A 전용 다차원 복합 지주사 구조 & 2025년 앵커링·시계열 분기 행 품질 검사
+function auditBrkAStructure(ticker, sheets) {
+  if (ticker !== 'BRK-A') {
+    return { status: 'N/A', failures: [] };
+  }
+
+  const failures = [];
+  const pushFail = (sheet, year, account, actual, expected) => {
+    failures.push(makeFailure(ticker, 'BRK_STRUCTURE', '6. BRK-A 구조', sheet, year, account, actual, expected));
+  };
+
+  const is = sheets['손익계산서'];
+  const bs = sheets['재무상태표'];
+  const cf = sheets['현금흐름표'];
+
+  // --- IS 구조 검사 ---
+  if (!is || is.rows.length === 0) {
+    pushFail('손익계산서', 'ALL', '(시트 누락)', '손익계산서 없음', 'BRK-A 손익계산서 존재');
+  } else {
+    const { years, rows } = is;
+    const revTotalRows = rows.filter((r) => r.label === '매출액');
+    if (revTotalRows.length !== 1) {
+      pushFail('손익계산서', 'ALL', '매출액', `연결 매출액 행 ${revTotalRows.length}개 존재`, '단일 연결 매출액 행 1개만 존재');
+    } else {
+      const revRow = revTotalRows[0];
+      years.forEach((yr, yi) => {
+        if (revRow.values[yi] === null) {
+          pushFail('손익계산서', yr, '매출액', 'null', '2016~2025 전 연도 연결 매출액 존재');
+        }
+      });
+    }
+
+    const dupLeasing = rows.filter((r) => /^리스수익$/i.test(r.label));
+    if (dupLeasing.length > 0) {
+      pushFail('손익계산서', 'ALL', '리스수익', `비부문 중복 행 ${dupLeasing.length}개 잔존`, '부문([보험및기타] 리스수익) 외 중복 제거');
+    }
+    const legacyFinIS = rows.filter((r) => /^\[금융·금융상품/.test(r.label));
+    if (legacyFinIS.length > 0) {
+      pushFail('손익계산서', 'ALL', '[금융·금융상품] 부문', `소급 재작성 완료 연도에 구 부문 ${legacyFinIS.length}행 잔존`, '2018 10-K 재작성 기준 2개 부문([보험및기타], [철도·유틸리티·에너지])만 유지');
+    }
+
+    const totalRevIdx = rows.findIndex((r) => r.label === '매출액');
+    const totalCostIdx = rows.findIndex((r) => r.label === '총원가및영업비용');
+    if (totalRevIdx === -1 || totalCostIdx === -1) {
+      pushFail('손익계산서', 'ALL', '매출액 / 총원가및영업비용', `revIdx=${totalRevIdx}, costIdx=${totalCostIdx}`, '연결 매출액 및 총원가및영업비용 행 존재');
+    } else {
+      const insRevSubIdx = rows.findIndex((r) => r.label === '[보험및기타 매출액 합계]');
+      const rrRevSubIdx = rows.findIndex((r) => r.label === '[철도·유틸리티·에너지 매출액 합계]');
+      const insCostSubIdx = rows.findIndex((r) => r.label === '[보험및기타 원가및영업비용 합계]');
+      const rrCostSubIdx = rows.findIndex((r) => r.label === '[철도·유틸리티·에너지 원가및영업비용 합계]');
+
+      if (insRevSubIdx === -1 || insRevSubIdx >= totalRevIdx || rrRevSubIdx === -1 || rrRevSubIdx >= totalRevIdx) {
+        pushFail('손익계산서', 'ALL', '부문별 매출액 합계 위치', `보험=${insRevSubIdx}, 철도=${rrRevSubIdx}, 연결매출=${totalRevIdx}`, '연결 매출액 위쪽에 양대 부문 매출 정위치');
+      }
+      if (
+        insCostSubIdx === -1 ||
+        insCostSubIdx <= totalRevIdx ||
+        insCostSubIdx >= totalCostIdx ||
+        rrCostSubIdx === -1 ||
+        rrCostSubIdx <= totalRevIdx ||
+        rrCostSubIdx >= totalCostIdx
+      ) {
+        pushFail('손익계산서', 'ALL', '부문별 원가및영업비용 합계 위치', `보험=${insCostSubIdx}, 철도=${rrCostSubIdx}, 연결비용=${totalCostIdx}`, '연결 매출액 아래와 총원가및영업비용 위쪽 사이에 정위치');
+      }
+
+      if (insRevSubIdx !== -1 && rrRevSubIdx !== -1) {
+        years.forEach((yr, yi) => {
+          const r1 = rows[insRevSubIdx].values[yi];
+          const r2 = rows[rrRevSubIdx].values[yi];
+          const rt = rows[totalRevIdx].values[yi];
+          if (rt !== null) {
+            if (r1 === null || r2 === null || Math.abs((r1 + r2) - rt) > 3) {
+              pushFail('손익계산서', yr, '부문 매출 합계 vs 연결 매출액', `${r1} + ${r2} = ${(r1 ?? 0) + (r2 ?? 0)}`, `매출액 = ${rt} (오차 <= 3)`);
+            }
+          }
+        });
+      }
+      if (insCostSubIdx !== -1 && rrCostSubIdx !== -1) {
+        years.forEach((yr, yi) => {
+          const c1 = rows[insCostSubIdx].values[yi];
+          const c2 = rows[rrCostSubIdx].values[yi];
+          const ct = rows[totalCostIdx].values[yi];
+          if (ct !== null) {
+            if (c1 === null || c2 === null || Math.abs((c1 + c2) - ct) > 3) {
+              pushFail('손익계산서', yr, '부문 비용 합계 vs 총원가및영업비용', `${c1} + ${c2} = ${(c1 ?? 0) + (c2 ?? 0)}`, `총원가및영업비용 = ${ct} (오차 <= 3)`);
+            }
+          }
+        });
+      }
+    }
+
+    // Class A / Class B EPS & Shares 구분 검사
+    const classAEps = rows.find((r) => /Class A.*주당순이익/i.test(r.label));
+    const classBEps = rows.find((r) => /Class B.*주당순이익/i.test(r.label));
+    const classAShares = rows.find((r) => /Class A.*발행주식수/i.test(r.label));
+    const classBShares = rows.find((r) => /Class B.*발행주식수/i.test(r.label));
+    if (!classAEps || !classBEps || !classAShares || !classBShares) {
+      pushFail(
+        '손익계산서',
+        'ALL',
+        'Class A / Class B 구분',
+        `A_EPS=${Boolean(classAEps)}, B_EPS=${Boolean(classBEps)}, A_SH=${Boolean(classAShares)}, B_SH=${Boolean(classBShares)}`,
+        'Class A / Class B 주당순이익 및 발행주식수 4행 모두 구분 존재'
+      );
+    } else {
+      const y2025Idx = years.indexOf('2025');
+      if (y2025Idx !== -1 && !(classAEps.values[y2025Idx] > classBEps.values[y2025Idx])) {
+        pushFail('손익계산서', '2025', 'Class A vs Class B EPS', `A=${classAEps.values[y2025Idx]}, B=${classBEps.values[y2025Idx]}`, 'Class A EPS > Class B EPS');
+      }
+      years.forEach((yr, yi) => {
+        for (const cr of [classAEps, classBEps, classAShares, classBShares]) {
+          if (cr.values[yi] === null) {
+            pushFail('손익계산서', yr, cr.label, 'null', '2016~2025 전 연도 수치 존재');
+          }
+        }
+      });
+    }
+
+    // 시계열 분기 행 분리 (파생상품 계약 손익 & 투자손익)
+    const derivRow = rows.find((r) => r.label === '파생상품 계약 손익');
+    const invRow = rows.find((r) => r.label === '투자손익');
+    if (!derivRow || !invRow) {
+      pushFail('손익계산서', 'ALL', '시계열 분기 행(투자손익 / 파생상품 계약 손익)', `inv=${Boolean(invRow)}, deriv=${Boolean(derivRow)}`, '2025 앵커 투자손익 및 과거 분기 파생상품 계약 손익 분리');
+    } else {
+      for (const y of ['2016', '2017', '2018', '2019']) {
+        const yi = years.indexOf(y);
+        if (yi !== -1 && derivRow.values[yi] === null) {
+          pushFail('손익계산서', y, '파생상품 계약 손익', 'null', '과거 분리 공시 연도(2016~2019) 수치 존재');
+        }
+      }
+      for (const y of ['2023', '2024', '2025']) {
+        const yi = years.indexOf(y);
+        if (yi !== -1 && derivRow.values[yi] !== null) {
+          pushFail('손익계산서', y, '파생상품 계약 손익', String(derivRow.values[yi]), '2023~2025년 null (시계열 분기 행 분리)');
+        }
+        if (yi !== -1 && invRow.values[yi] === null) {
+          pushFail('손익계산서', y, '투자손익', 'null', '최신(2023~2025) 앵커 수치 존재');
+        }
+      }
+    }
+  }
+
+  // --- BS 구조 검사 ---
+  if (!bs || bs.rows.length === 0) {
+    pushFail('재무상태표', 'ALL', '(시트 누락)', '재무상태표 없음', 'BRK-A 재무상태표 존재');
+  } else {
+    const { years, rows } = bs;
+    const lastRow = rows[rows.length - 1];
+    if (lastRow?.label !== '[[부채와자본총계]]') {
+      pushFail('재무상태표', 'ALL', lastRow?.label || '(없음)', `마지막 행="${lastRow?.label}"`, '마지막 행="[[부채와자본총계]]"');
+    }
+
+    const reqRows = [
+      rows.find((r) => r.label === '[보험및기타] 현금및현금성자산'),
+      rows.find((r) => r.label === '[철도·유틸리티·에너지] 현금및현금성자산'),
+      rows.find((r) => r.label === '[보험및기타] 미국 국채 단기투자'),
+    ];
+    const reqNames = [
+      '[보험및기타] 현금및현금성자산',
+      '[철도·유틸리티·에너지] 현금및현금성자산',
+      '[보험및기타] 미국 국채 단기투자',
+    ];
+    reqRows.forEach((row, idx) => {
+      if (!row) {
+        pushFail('재무상태표', '2018~2025', reqNames[idx], '행 누락', '2018~2025 부문별 현금 및 미국 국채 단기투자 복원');
+      } else {
+        for (let y = 2018; y <= 2025; y++) {
+          const yi = years.indexOf(String(y));
+          if (yi !== -1 && !(row.values[yi] > 0)) {
+            pushFail('재무상태표', String(y), reqNames[idx], String(row.values[yi]), '> 0 (누락 없이 복원)');
+          }
+        }
+      }
+    });
+
+    const segAssetTotals = rows.filter((r) => /^\[.*자산 합계\]$/.test(r.label));
+    const totalAssetsRow = rows.find((r) => r.label === '[[자산총계]]');
+    if (segAssetTotals.length < 2 || !totalAssetsRow) {
+      pushFail('재무상태표', 'ALL', '부문별 자산 합계', `부문자산합계=${segAssetTotals.length}개`, '부문별 자산 합계 및 [[자산총계]] 존재');
+    } else {
+      years.forEach((yr, yi) => {
+        const ta = totalAssetsRow.values[yi];
+        if (ta === null) return;
+        const sumSeg = segAssetTotals.reduce((acc, r) => acc + (r.values[yi] ?? 0), 0);
+        if (Math.abs(sumSeg - ta) > 3) {
+          pushFail('재무상태표', yr, '부문별 자산 합계 vs [[자산총계]]', String(sumSeg), `${ta} (오차 <= 3)`);
+        }
+      });
+    }
+  }
+
+  // --- CF 구조 검사 ---
+  if (!cf || cf.rows.length === 0) {
+    pushFail('현금흐름표', 'ALL', '(시트 누락)', '현금흐름표 없음', 'BRK-A 현금흐름표 존재');
+  } else {
+    const { years, rows } = cf;
+    const finIdx = rows.findIndex((r) => r.label === '[재무활동현금흐름]');
+    const reqCfLabels = [
+      '[보험및기타] 장기차입금의 차입',
+      '[보험및기타] 장기차입금의 상환',
+      '[철도·유틸리티·에너지] 장기차입금의 차입',
+      '[철도·유틸리티·에너지] 장기차입금의 상환',
+    ];
+    for (const lbl of reqCfLabels) {
+      const idx = rows.findIndex((r) => r.label === lbl);
+      if (idx === -1 || finIdx === -1 || idx >= finIdx) {
+        pushFail('현금흐름표', 'ALL', lbl, `행위치=${idx}, [재무활동현금흐름]=${finIdx}`, '[재무활동현금흐름] 위쪽에 정위치');
+      }
+    }
+
+    const dupNciRows = rows.filter((r) =>
+      /비지배지분\s*취득.*기타|acquisitions?\s+of\s+noncontrolling\s+interests?\s+and\s+other/i.test(
+        r.label
+      )
+    );
+    const y2016Idx = years.indexOf('2016');
+    for (const dr of dupNciRows) {
+      if (y2016Idx !== -1 && dr.values[y2016Idx] !== null && dr.values[y2016Idx] > 0) {
+        pushFail('현금흐름표', '2016', dr.label, `+${dr.values[y2016Idx]}`, '중복 및 양수 오류 제거');
+      }
+    }
+  }
+
+  return {
+    status: failures.length === 0 ? 'PASS' : 'FAIL',
+    failures,
+  };
+}
+
 async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
   const startedAt = Date.now();
   const req = new Request('http://localhost/api/analyze', {
@@ -1002,6 +1233,7 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
         SCALE_JUMP: { status: 'FAIL', failures: [] },
         OUTFLOW_SIGN: { status: 'FAIL', failures: [] },
         UNTRANSLATED: { status: 'FAIL', failures: [] },
+        BRK_STRUCTURE: ticker === 'BRK-A' ? { status: 'FAIL', failures: [] } : { status: 'N/A', failures: [] },
       },
       allFailures: [apiFail],
       overall: 'FAIL',
@@ -1029,6 +1261,7 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
   const c3 = auditScaleJumps(ticker, sheets);
   const c4 = auditCashOutflowSigns(ticker, sheets);
   const c5 = auditUntranslatedLabels(ticker, sheets);
+  const c6 = auditBrkAStructure(ticker, sheets);
 
   const allFailures = [
     ...c1.failures,
@@ -1036,6 +1269,7 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
     ...c3.failures,
     ...c4.failures,
     ...c5.failures,
+    ...c6.failures,
   ];
 
   const overall =
@@ -1043,7 +1277,8 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
     c2.status === 'PASS' &&
     c3.status === 'PASS' &&
     c4.status === 'PASS' &&
-    c5.status === 'PASS'
+    c5.status === 'PASS' &&
+    c6.status !== 'FAIL'
       ? 'PASS'
       : 'FAIL';
 
@@ -1059,6 +1294,7 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
       SCALE_JUMP: c3,
       OUTFLOW_SIGN: c4,
       UNTRANSLATED: c5,
+      BRK_STRUCTURE: c6,
     },
     allFailures,
     overall,
@@ -1066,6 +1302,7 @@ async function analyzeAndAuditTicker(ticker, apiKey, userEmail) {
 }
 
 function formatCheckCell(checkRes) {
+  if (!checkRes || checkRes.status === 'N/A') return '-';
   if (checkRes.status === 'PASS') return 'PASS';
   return `FAIL(${checkRes.failures.length})`;
 }
@@ -1150,6 +1387,7 @@ async function main() {
           SCALE_JUMP: { status: 'FAIL', failures: [] },
           OUTFLOW_SIGN: { status: 'FAIL', failures: [] },
           UNTRANSLATED: { status: 'FAIL', failures: [] },
+          BRK_STRUCTURE: ticker === 'BRK-A' ? { status: 'FAIL', failures: [] } : { status: 'N/A', failures: [] },
         },
         allFailures: [crashFail],
         overall: 'FAIL',
@@ -1169,6 +1407,7 @@ async function main() {
     { header: '3.단위급변', width: 12 },
     { header: '4.유출부호', width: 12 },
     { header: '5.미번역영문', width: 14 },
+    { header: '6.BRK구조', width: 12 },
     { header: '종합', width: 8 },
   ];
 
@@ -1185,7 +1424,8 @@ async function main() {
       padEndDisplay(formatCheckCell(r.checks.SCALE_JUMP), cols[4].width),
       padEndDisplay(formatCheckCell(r.checks.OUTFLOW_SIGN), cols[5].width),
       padEndDisplay(formatCheckCell(r.checks.UNTRANSLATED), cols[6].width),
-      padEndDisplay(r.overall, cols[7].width),
+      padEndDisplay(formatCheckCell(r.checks.BRK_STRUCTURE), cols[7].width),
+      padEndDisplay(r.overall, cols[8].width),
     ].join(' | ');
     console.log(line);
   }
@@ -1247,7 +1487,7 @@ async function main() {
       }
     }
   } else {
-    console.log('\n모든 검증 항목(5대 회계 감사)을 100% 통과했습니다!');
+    console.log('\n모든 검증 항목(5대 회계 감사 + BRK-A 구조 검증)을 100% 통과했습니다!');
   }
 
   const passCount = results.filter((r) => r.overall === 'PASS').length;
