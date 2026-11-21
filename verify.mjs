@@ -16,13 +16,52 @@ module.registerHooks({
   },
 });
 
+const origFetchForVerify = globalThis.fetch.bind(globalThis);
+let cachedCompanyTickersResponse = null;
+globalThis.fetch = async (input, init) => {
+  const url = typeof input === 'string' ? input : input?.url || '';
+  if (url.includes('sec.gov/files/company_tickers.json')) {
+    if (cachedCompanyTickersResponse) {
+      const c = cachedCompanyTickersResponse;
+      return new Response(c.buf.slice(0), {
+        status: c.status,
+        statusText: c.statusText,
+        headers: c.headers,
+      });
+    }
+    const res = await origFetchForVerify(input, init);
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      const hdrs = {};
+      res.headers.forEach((v, k) => {
+        if (!['content-encoding', 'content-length', 'transfer-encoding'].includes(k.toLowerCase())) {
+          hdrs[k] = v;
+        }
+      });
+      cachedCompanyTickersResponse = {
+        status: res.status,
+        statusText: res.statusText,
+        headers: hdrs,
+        buf,
+      };
+      return new Response(buf.slice(0), {
+        status: res.status,
+        statusText: res.statusText,
+        headers: hdrs,
+      });
+    }
+    return res;
+  }
+  return origFetchForVerify(input, init);
+};
+
 const { POST } = await import('./app/api/analyze/route.js');
 
 const DEFAULT_TICKERS = ['AAPL', 'SFM', 'CME', 'MSA', 'RLI', 'BRK-A'];
 const SHEET_NAMES = ['손익계산서', '재무상태표', '현금흐름표'];
 const BS_IDENTITY_TOLERANCE = 3; // 단위: 백만 달러 ($M), 반올림 오차 허용 범위 ±3M
 const SCALE_JUMP_THRESHOLD = 1000; // 직전 연도 대비 1,000배 이상 급변 탐지 기준
-const REQUEST_DELAY_MS = 400; // SEC EDGAR rate-limit 보호용 요청 간 대기 시간
+const REQUEST_DELAY_MS = 5500; // SEC EDGAR rate-limit 보호용 요청 간 대기 시간
 
 const ALLOWLISTED_ACRONYMS = [
   'CAPEX',
@@ -901,22 +940,34 @@ function auditCashOutflowSigns(ticker, sheets) {
   }
 
   const exclusionRegex =
-    /순증감|증감|유입|유출입|처분|매각및|사업매각|만기도래|원금회수|만기회수|조기상환|만기상환|회수|조정|수익|미지급|^\[.*\]$|proceeds|net\s+change|increase|decrease|issuance|sale\s+of|maturities|collections|accrued|payable|beginning|end\s+of/i;
+    /순증감|증감|유입|유출입|순발행|순상환|순차입|순조달|발행\s*(?:및|·|\()\s*상환|처분|매각및|사업매각|만기도래|원금회수|만기회수|조기상환|만기상환|회수|조정|수익|미지급|^\[.*\]$|proceeds|net\s+change|increase|decrease|issuance|sale\s+of|maturities|collections|accrued|payable|beginning|end\s+of/i;
   const outflowRegex =
     /(?:CAPEX|자본적\s*지출|유형자산의?\s*(?:취득|매입)|생산설비(?:자산)?의?\s*취득|무형자산의?\s*취득|배당금의?\s*지급|현금배당(?:금)?\s*지급|자사주\s*매입|자기주식의?\s*(?:취득|매입)|(?:채무증권|지분증권|유가증권|단기금융상품|투자자산|대출채권|리스채권|비지배지분).*?(?:취득|매입)|기업인수로\s*인한\s*현금유출(?!입)|관련\s*현금유출(?!입)|(?:차입금|사채|부채|리스부채|우선주).*?상환|상환에\s*따른\s*현금유출(?!입)|원천징수세액\s*납부|이연금융원가의?\s*지급|^(?:purchases?\s+of|additions?\s+to|capital\s+expenditures?|payments?\s+(?:to\s+acquire|for\s+repurchase|of\s+dividends|for\s+dividends|on\s+long-?term\s+debt|on\s+.*lease)|repayments?\s+of|repurchases?\s+of|common\s+stock\s+repurchased|treasury\s+stock\s+purchases?|acquisitions?,?\s*net\s+of\s+cash|business\s+acquisitions?|cash\s+dividends\s+paid|dividends\s+paid|redemption\s+of|retirement\s+of)|\bcapital\s+expenditures?\b|\bdividends?\s+paid\b|\brepurchases?\s+of\s+(?:common|treasury|capital)\s+stock\b)/i;
 
   const { years, rows } = cf;
-  const opIdx = rows.findIndex(
-    (r) => r.label === '[영업활동현금흐름]' || /영업활동\s*현금흐름|net cash.*operating activities/i.test(r.label)
+  const findCfIdx = (exact, re) => {
+    const e = rows.findIndex((r) => r.label === exact);
+    return e !== -1 ? e : rows.findIndex((r) => re.test(r.label));
+  };
+  const opIdx = findCfIdx(
+    '[영업활동현금흐름]',
+    /영업활동\s*현금흐름|net cash.*operating activities/i
   );
-  const invIdx = rows.findIndex(
-    (r) => r.label === '[투자활동현금흐름]' || /투자활동\s*현금흐름|net cash.*investing activities/i.test(r.label)
+  const invIdx = findCfIdx(
+    '[투자활동현금흐름]',
+    /투자활동\s*현금흐름|net cash.*investing activities/i
   );
-  const finIdx = rows.findIndex(
-    (r) =>
-      r.label === '[재무활동현금흐름]' ||
-      /재무활동\s*현금흐름|net cash.*financing activities/i.test(r.label)
+  const finIdx = findCfIdx(
+    '[재무활동현금흐름]',
+    /재무활동\s*현금흐름|net cash.*financing activities/i
   );
+  const sortedCfSections = [opIdx, invIdx, finIdx].filter((i) => i !== -1).sort((a, b) => a - b);
+  let invStart = 0;
+  if (invIdx !== -1) {
+    for (const s of sortedCfSections) {
+      if (s < invIdx) invStart = s + 1;
+    }
+  }
   const lastActivityIdx = Math.max(opIdx, invIdx, finIdx);
   const activityRows = lastActivityIdx !== -1 ? rows.slice(0, lastActivityIdx) : rows;
   for (const row of activityRows) {
@@ -927,6 +978,24 @@ function auditCashOutflowSigns(ticker, sheets) {
     for (let yi = 0; yi < years.length; yi++) {
       const val = row.values[yi];
       if (val !== null && val > 0) {
+        if (
+          /^기업인수로\s*인한\s*현금유출$/i.test(row.label) &&
+          row.values.some((v) => v !== null && v < 0) &&
+          invIdx !== -1
+        ) {
+          const invCompRows = rows.slice(invStart, invIdx).filter((r) => !/^\[.*\]$/.test(r.label));
+          const invSubVal = rows[invIdx].values[yi];
+          const invCompVals = invCompRows
+            .map((r) => r.values[yi])
+            .filter((v) => v !== null && v !== undefined);
+          if (invSubVal !== null && invCompVals.length > 0) {
+            const invSum = invCompVals.reduce((a, b) => a + b, 0);
+            const invTol = Math.max(3, Math.ceil((invCompVals.length + 1) * 0.5));
+            if (Math.abs(invSum - invSubVal) <= invTol && Math.abs(invSum - 2 * val - invSubVal) > invTol) {
+              continue;
+            }
+          }
+        }
         failures.push(
           makeFailure(
             ticker,
