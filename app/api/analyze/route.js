@@ -1153,8 +1153,104 @@ function isMezzanineOrTemporaryEquityRow(tag = '', label = '') {
   );
 }
 
-// 12. 소계 항등식 역산을 통한 자동 부호 교정 엔진 (Phase A 안전장치 포함)
+// 12. 소계 항등식 역산을 통한 자동 부호 교정 엔진 (Phase A 안전장치 + IS 보수적 부호 안전망)
 function autoFixRowSignsBySubtotalReconciliation(rows, targetYears, stmtType) {
+  if (stmtType === 'IS') {
+    if (rows.some((r) => r.dimAxis === 'ProductOrServiceAxis')) return;
+    const metaIdx = rows.findIndex((r) => r.rowType === 'EPS' || r.rowType === 'SHARES');
+    const limit = metaIdx !== -1 ? metaIdx : rows.length;
+    const findMainIdx = (tags) =>
+      rows.findIndex((r, idx) => idx < limit && r.isMainRow && r.rowType === 'USD' && tags.includes(r.tag));
+
+    const opIdx = findMainIdx(['OperatingIncomeLoss']);
+    const preTaxIdx = findMainIdx([
+      'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+      'IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments',
+    ]);
+    const taxIdx = findMainIdx(['IncomeTaxExpenseBenefit']);
+    const netIdx = rows.findIndex(
+      (r, idx) =>
+        idx > (taxIdx !== -1 ? taxIdx : preTaxIdx) &&
+        idx < limit &&
+        r.rowType === 'USD' &&
+        (r.tag === 'IncomeLossFromContinuingOperations' ||
+          r.tag === 'ProfitLoss' ||
+          r.tag === 'NetIncomeLoss')
+    );
+
+    const recentYears = targetYears.slice(-3);
+
+    // 1) 영업이익 -> 법인세비용차감전순이익 단일 비영업/이자비용 행 부호 안전망
+    if (opIdx !== -1 && preTaxIdx !== -1 && opIdx < preTaxIdx) {
+      const comps = [];
+      for (let i = opIdx + 1; i < preTaxIdx; i++) {
+        if (rows[i].rowType === 'USD' && !rows[i].isTotalRow) comps.push(i);
+      }
+      if (comps.length > 0 && comps.length <= 5) {
+        let anchorOkCount = 0;
+        for (const y of recentYears) {
+          const op = rows[opIdx].rValuesByYear?.[y];
+          const pt = rows[preTaxIdx].rValuesByYear?.[y];
+          if (op === undefined || pt === undefined) continue;
+          const sumComps = comps.reduce((acc, i) => acc + (rows[i].rValuesByYear?.[y] ?? 0), 0);
+          if (Math.abs(op + sumComps - pt) <= 3) anchorOkCount++;
+        }
+        if (anchorOkCount >= 1) {
+          for (const y of targetYears) {
+            const op = rows[opIdx].rValuesByYear?.[y];
+            const pt = rows[preTaxIdx].rValuesByYear?.[y];
+            if (op === undefined || pt === undefined) continue;
+            const sumComps = comps.reduce((acc, i) => acc + (rows[i].rValuesByYear?.[y] ?? 0), 0);
+            const curErr = Math.abs(op + sumComps - pt);
+            if (curErr <= 3) continue;
+            for (const cIdx of comps) {
+              const val = rows[cIdx].rValuesByYear?.[y];
+              if (val === undefined || val === 0) continue;
+              const anchorHasSameSignAsFlip = recentYears.some(
+                (ry) =>
+                  rows[cIdx].rValuesByYear?.[ry] !== undefined &&
+                  rows[cIdx].rValuesByYear?.[ry] !== 0 &&
+                  Math.sign(rows[cIdx].rValuesByYear[ry]) === Math.sign(-val)
+              );
+              if (!anchorHasSameSignAsFlip) continue;
+              if (Math.abs(op + sumComps - 2 * val - pt) <= 3) {
+                rows[cIdx].rValuesByYear[y] = -val;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2) 세전이익 +- 법인세 = 순이익 안전망 (단, 앵커 산식과 어긋날 때만 교정)
+    if (preTaxIdx !== -1 && taxIdx !== -1 && netIdx !== -1 && preTaxIdx < taxIdx && taxIdx < netIdx) {
+      let minusOk = 0;
+      let plusOk = 0;
+      for (const y of recentYears) {
+        const pt = rows[preTaxIdx].rValuesByYear?.[y];
+        const tx = rows[taxIdx].rValuesByYear?.[y];
+        const nt = rows[netIdx].rValuesByYear?.[y];
+        if (pt === undefined || tx === undefined || tx === 0 || nt === undefined) continue;
+        if (Math.abs(pt - tx - nt) <= 3) minusOk++;
+        if (Math.abs(pt + tx - nt) <= 3) plusOk++;
+      }
+      if ((minusOk > 0) !== (plusOk > 0)) {
+        const taxOp = minusOk > plusOk ? -1 : 1;
+        for (const y of targetYears) {
+          const pt = rows[preTaxIdx].rValuesByYear?.[y];
+          const tx = rows[taxIdx].rValuesByYear?.[y];
+          const nt = rows[netIdx].rValuesByYear?.[y];
+          if (pt === undefined || tx === undefined || tx === 0 || nt === undefined) continue;
+          if (Math.abs(pt + taxOp * tx - nt) > 3 && Math.abs(pt - taxOp * tx - nt) <= 3) {
+            rows[taxIdx].rValuesByYear[y] = -tx;
+          }
+        }
+      }
+    }
+    return;
+  }
+
   if (stmtType !== 'CF' && stmtType !== 'BS') return;
 
   const isFlipForbidden = (row, val) => {
@@ -1517,28 +1613,41 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
       const trBlocks = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
 
       const headerRows = [];
+      let colDurations = [];
       for (const tr of trBlocks) {
         if (/class=["']nump?["']/i.test(tr)) break;
         if (!/<th[\s>]/i.test(tr)) continue;
         const thCells = tr.match(/<th[\s\S]*?<\/th>/gi) || [];
         const extractedCells = [];
+        const expandedDurations = [];
+        let hasDurationCell = false;
 
         for (const th of thCells) {
           if (/class=["']tl["']/i.test(th)) continue;
+          const colspanMatch = th.match(/colspan=["']?(\d+)["']?/i);
+          const colspan = colspanMatch ? Math.max(1, parseInt(colspanMatch[1], 10)) : 1;
           const text = th
             .replace(/<[^>]+>/g, ' ')
             .replace(/&#160;|&nbsp;/gi, ' ')
             .replace(/\s+/g, ' ')
             .trim();
-          if (/^\d+\s*months?\s*ended$/i.test(text)) continue;
+          if (/^\d+\s*(?:months?|weeks?)\s*ended$/i.test(text)) {
+            hasDurationCell = true;
+            for (let k = 0; k < colspan; k++) expandedDurations.push(text);
+            continue;
+          }
+          for (let k = 0; k < colspan; k++) expandedDurations.push(text);
           extractedCells.push(text);
         }
-        if (extractedCells.length > 0) {
+        if (hasDurationCell && extractedCells.every((c) => !c)) {
+          colDurations = expandedDurations;
+        } else if (extractedCells.length > 0) {
           headerRows.push(extractedCells);
         }
       }
 
-      let colYears = [];
+      const isAnnualDur = (d) => /^(?:12\s*months?|5[23]\s*weeks?)\s*ended$/i.test(d);
+      const colEntries = [];
       const yearRowIdx = headerRows.findLastIndex((r) => r.some((c) => /\b(20\d{2})\b/.test(c)));
       if (yearRowIdx !== -1) {
         const yearRow = headerRows[yearRowIdx];
@@ -1546,8 +1655,14 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
           yearRowIdx > 0 && headerRows[yearRowIdx - 1].length === yearRow.length
             ? headerRows[yearRowIdx - 1]
             : null;
+        const hasMixedDurations =
+          stmtType !== 'BS' &&
+          colDurations.length === yearRow.length &&
+          colDurations.some(isAnnualDur) &&
+          colDurations.some((d) => !isAnnualDur(d));
 
         for (let c = 0; c < yearRow.length; c++) {
+          if (hasMixedDurations && !isAnnualDur(colDurations[c])) continue;
           const fullDateText = prevRow ? `${prevRow[c]} ${yearRow[c]}` : yearRow[c];
           const yrMatch = fullDateText.match(/\b(20\d{2})\b/);
           if (yrMatch) {
@@ -1555,16 +1670,17 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
             if (/\bJan(?:uary)?\.?\s*(?:0?[1-9]|1[0-5])\b/i.test(fullDateText)) {
               yr -= 1;
             }
-            colYears.push(yr);
+            colEntries.push({ colIdx: c, yr });
           }
         }
       }
 
-      for (let i = 1; i < colYears.length; i++) {
-        if (colYears[i] === colYears[i - 1]) {
-          colYears[i] = colYears[i - 1] - 1;
+      for (let i = 1; i < colEntries.length; i++) {
+        if (colEntries[i].yr === colEntries[i - 1].yr) {
+          colEntries[i].yr = colEntries[i - 1].yr - 1;
         }
       }
+      const colYears = colEntries.map((e) => e.yr);
 
       let rows = [];
       let currentSection = '';
@@ -1785,9 +1901,9 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
         const rawNumbersByYear = {};
         let hasAnyNumber = false;
 
-        for (let i = 0; i < Math.min(colYears.length, valueCells.length); i++) {
-          const yr = colYears[i];
-          const td = valueCells[i];
+        for (const { colIdx, yr } of colEntries) {
+          if (colIdx >= valueCells.length) continue;
+          const td = valueCells[colIdx];
           const rawText = td
             .replace(/<[^>]+>/g, '')
             .replace(/&#160;|&nbsp;|\$|,/gi, '')
@@ -2489,10 +2605,34 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
             !isMezzanineOrTemporaryEquityRow(targetAnchor.tag, targetAnchor.contextualLabel)
               ? findOwningSubtotalRow(anchorRows, aIdx, true, targetAnchor.dimMember || '', stmtType)
               : null;
+
+          let isSignFactor = 1;
+          if (stmtType === 'IS' && targetAnchor.rowType === 'USD') {
+            let oppCount = 0;
+            let sameCount = 0;
+            for (const [yr, oVal] of Object.entries(sourceOlder.rValuesByYear || {})) {
+              const aVal = targetAnchor.rValuesByYear?.[yr];
+              if (
+                typeof aVal === 'number' &&
+                typeof oVal === 'number' &&
+                aVal !== 0 &&
+                oVal !== 0 &&
+                Math.abs(Math.abs(aVal) - Math.abs(oVal)) <= 2
+              ) {
+                if (Math.sign(aVal) === -Math.sign(oVal)) oppCount++;
+                else sameCount++;
+              }
+            }
+            if (oppCount > 0 && sameCount === 0) {
+              isSignFactor = -1;
+            }
+          }
+
           for (const [yr, val] of Object.entries(sourceOlder.rValuesByYear)) {
             if (ownerSub?.lockedYears?.has(String(yr))) continue;
             if (targetAnchor.rValuesByYear[yr] === undefined) {
-              targetAnchor.rValuesByYear[yr] = val;
+              targetAnchor.rValuesByYear[yr] =
+                typeof val === 'number' && val !== 0 && isSignFactor === -1 ? -val : val;
             }
           }
         };
@@ -3247,6 +3387,71 @@ function translateDimensionalRowKorName(item, stmtType) {
   return null;
 }
 
+const PRESERVED_SHORT_ACRONYMS = new Set([
+  'CAPEX',
+  'CP',
+  'IB',
+  'OTTI',
+  'ROU',
+  'EPS',
+  'AOCI',
+  'LIFO',
+  'FIFO',
+  'VIE',
+  'M&A',
+  'R&D',
+  'SG&A',
+  'EBIT',
+  'EBITDA',
+  'IT',
+  'FX',
+  'US',
+  'U.S.',
+  'RSU',
+  'PSU',
+  'GAAP',
+  'IFRS',
+  'SEC',
+  'IRS',
+]);
+
+function sanitizeAiKoreanLabel(aiKor) {
+  if (!aiKor || typeof aiKor !== 'string') return null;
+  let s = aiKor.trim();
+  if (!/[가-힣]/.test(s)) return null;
+
+  // 허용된 표준 약어가 아닌 영문 단독 괄호 병기(예: (MSRs), (ATM), (Mortgage Servicing Rights)) 제거
+  s = s.replace(/\(([A-Za-z0-9.\s,&/'-]+)\)/g, (full, inner) => {
+    const token = inner.trim();
+    if (!/[A-Za-z]/.test(token)) return full;
+    if (PRESERVED_SHORT_ACRONYMS.has(token.toUpperCase())) return full;
+    return '';
+  });
+
+  s = s.replace(/\s+/g, ' ').trim();
+  if (!/[가-힣]/.test(s)) return null;
+
+  const residualTokens = s.match(/[A-Za-z]+/g) || [];
+  const hasBadEng = residualTokens.some((tok) => !PRESERVED_SHORT_ACRONYMS.has(tok.toUpperCase()));
+  if (hasBadEng) {
+    s = s
+      .replace(/[A-Za-z]+(?:[-/&.\s]+[A-Za-z]+)*/g, (m) => {
+        const clean = m.trim().toUpperCase();
+        return PRESERVED_SHORT_ACRONYMS.has(clean) ? m : ' ';
+      })
+      .replace(/\(\s*\)/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  if (!/[가-힣]/.test(s)) return null;
+  const finalCheck = s.match(/[A-Za-z]+/g) || [];
+  if (finalCheck.some((tok) => !PRESERVED_SHORT_ACRONYMS.has(tok.toUpperCase()))) {
+    return null;
+  }
+  return s;
+}
+
 // Gemini 응답 지연/실패 시에도 영문이 남지 않도록 보장하는 최종 한글 구문 조합기
 function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
   const src = stripDynamicParentheticals(engLabel || tag);
@@ -3255,6 +3460,24 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
 
   const lower = src.toLowerCase();
   const phraseDict = [
+    ['mortgage servicing rights', '모기지관리권자산'],
+    ['servicing rights', '관리권자산'],
+    ['contingent consideration', '조건부대가'],
+    ['rental equipment', '렌탈장비'],
+    ['deferred gain', '이연이익'],
+    ['pension settlement', '연금정산'],
+    ['commercial paper', '기업어음'],
+    ['unconsolidated entities', '비연결법인'],
+    ['real estate held for investment', '투자부동산'],
+    ['real estate held for sale', '매각예정부동산'],
+    ['revolving credit', '회전신용한도'],
+    ['line of credit', '신용한도'],
+    ['mortgages payable', '담보차입금'],
+    ['bargain purchase gain', '염가매수차익'],
+    ['securities borrowed', '차입유가증권'],
+    ['trading liabilities', '단기매매금융부채'],
+    ['beneficial interests', '수익증권'],
+    ['escrow deposits', '에스크로예치금'],
     ['available-for-sale', '매도가능금융자산'],
     ['held-to-maturity', '만기보유금융자산'],
     ['fixed maturities', '채무증권'],
@@ -3329,12 +3552,16 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
   return src;
 }
 
-// Gemini AI 한글 번역 함수
-async function alignAndTranslateWithGemini(itemsToTranslate, allSheetsRows, apiKey) {
-  if (!itemsToTranslate || itemsToTranslate.length === 0) return {};
+const PREFERRED_FLASH_MODELS = [
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash',
+];
 
+async function translateGeminiChunk(batchItems, modelCandidates, deadModels, apiKey) {
   const indexedPayload = {};
-  itemsToTranslate.forEach((item, idx) => {
+  batchItems.forEach((item, idx) => {
     indexedPayload[String(idx)] = {
       stmt: item.stmtType,
       label: item.contextualLabel,
@@ -3343,9 +3570,10 @@ async function alignAndTranslateWithGemini(itemsToTranslate, allSheetsRows, apiK
   });
 
   const prompt = `당신은 미국 SEC 10-K 재무제표 전문 한국어 공인회계사입니다.
-아래 JSON 객체의 영문 재무제표 계정명(label, tag)들을 한국 실무 회계 기준(K-IFRS / 금융·보험·제조·유통 회계기준)에 맞는 정확하고 자연스러운 **순수 한글 계정명**으로 번역하세요.
-- 숫자 Key("0", "1"...)를 그대로 유지하세요.
-- 영어 알파벳이나 괄호 안의 달러($) 숫자를 남기지 말고, 원래 영문 회계 계정의 의미를 정확히 살린 한글 계정명(문자열)으로 응답하세요.
+아래 JSON 객체의 영문 재무제표 계정명(label, tag)들을 한국 실무 회계 기준(K-IFRS / 금융·보험·리츠·제조·유통 회계기준)에 맞는 정확하고 자연스러운 **순수 한글 계정명**으로 번역하세요.
+- 숫자 Key("0", "1"...)를 하나도 빠짐없이 그대로 유지하여 JSON 객체로만 응답하세요.
+- 괄호 안에 영문 원어나 영문 약어(예: MSRs, ATM, NIM 등)를 병기하지 말고 순수 한글 계정명만 출력하세요.
+- 달러($) 표기나 (in dollars) 같은 불필요한 괄호는 제거하세요.
 - 합계(Total)가 아닌 개별 영업비용(예: Insurance operating expenses)은 절대 '영업비용합계'로 번역하지 말고 '보험영업비용'처럼 구체적으로 번역하세요.
 
 응답 예시:
@@ -3354,13 +3582,93 @@ async function alignAndTranslateWithGemini(itemsToTranslate, allSheetsRows, apiK
 [번역할 계정 목록]
 ${JSON.stringify(indexedPayload)}`;
 
-  let candidateModels = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+  const chunkResult = {};
+  for (const modelName of modelCandidates) {
+    if (deadModels.has(modelName)) continue;
+    const url = makeUrl(
+      ['generativelanguage', 'googleapis', 'com'],
+      `v1beta/models/${modelName}:generateContent?key=${apiKey}`
+    );
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.1,
+              responseMimeType: 'application/json',
+            },
+          }),
+          signal: AbortSignal.timeout(12000),
+        });
+
+        if (response.status === 404 || response.status === 403 || response.status === 429) {
+          deadModels.add(modelName);
+          break;
+        }
+        if (response.status === 400 || response.status === 401) {
+          return chunkResult;
+        }
+        if (response.status === 503 || response.status >= 500) {
+          if (attempt === 0) {
+            await delay(400);
+            continue;
+          }
+          break;
+        }
+        if (!response.ok) break;
+
+        const data = await response.json();
+        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+        let parsed = null;
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            try {
+              parsed = JSON.parse(jsonMatch[0]);
+            } catch {}
+          }
+        }
+        if (!parsed || typeof parsed !== 'object') break;
+
+        batchItems.forEach((item, idx) => {
+          const val = parsed[String(idx)];
+          const kor = typeof val === 'string' ? val : val?.kor;
+          if (kor && typeof kor === 'string' && kor.trim()) {
+            chunkResult[item.rowKey] = kor.trim();
+          }
+        });
+
+        if (Object.keys(chunkResult).length > 0) return chunkResult;
+        break;
+      } catch (e) {
+        if (attempt === 0) {
+          await delay(400);
+          continue;
+        }
+      }
+    }
+  }
+
+  return chunkResult;
+}
+
+// Gemini AI 한글 번역 함수 (20개 단위 청크 + 최대 4동시 병렬 + 누락키 2차 보완)
+async function alignAndTranslateWithGemini(itemsToTranslate, allSheetsRows, apiKey) {
+  if (!itemsToTranslate || itemsToTranslate.length === 0) return {};
+
+  let candidateModels = [...PREFERRED_FLASH_MODELS];
   try {
     const listUrl = makeUrl(
       ['generativelanguage', 'googleapis', 'com'],
       `v1beta/models?key=${apiKey}`
     );
-    const listRes = await fetch(listUrl);
+    const listRes = await fetch(listUrl, { signal: AbortSignal.timeout(4000) });
     if (listRes.ok) {
       const listData = await listRes.json();
       const available = (listData.models || [])
@@ -3372,55 +3680,47 @@ ${JSON.stringify(indexedPayload)}`;
         )
         .map((m) => m.name.replace(/^models\//, ''));
 
-      const flashModels = available.filter(
-        (n) => /flash/i.test(n) && !/8b|image|tts|audio|thinking|exp/i.test(n)
-      );
-      if (flashModels.length > 0) {
-        candidateModels = [...new Set([...flashModels, ...candidateModels])];
+      const availSet = new Set(available);
+      const preferredAvail = PREFERRED_FLASH_MODELS.filter((m) => availSet.has(m));
+      if (preferredAvail.length > 0) {
+        candidateModels = preferredAvail;
       }
     }
   } catch (e) {}
 
-  for (const modelName of candidateModels) {
-    const url = makeUrl(
-      ['generativelanguage', 'googleapis', 'com'],
-      `v1beta/models/${modelName}:generateContent?key=${apiKey}`
-    );
+  const deadModels = new Set();
+  const result = {};
 
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1 },
-        }),
-      });
-
-      if (!response.ok) continue;
-
-      const data = await response.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) continue;
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      const result = {};
-      itemsToTranslate.forEach((item, idx) => {
-        const val = parsed[String(idx)];
-        const kor = typeof val === 'string' ? val : val?.kor;
-        if (kor && typeof kor === 'string') {
-          result[item.rowKey] = kor.trim();
-        }
-      });
-
-      if (Object.keys(result).length > 0) return result;
-    } catch (e) {
-      continue;
+  const runChunksInPool = async (targetItems, chunkSize = 20, maxConcurrency = 4) => {
+    const chunks = [];
+    for (let i = 0; i < targetItems.length; i += chunkSize) {
+      chunks.push(targetItems.slice(i, i + chunkSize));
     }
+    let nextIdx = 0;
+    const workerCount = Math.min(maxConcurrency, chunks.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIdx < chunks.length) {
+        const myIdx = nextIdx++;
+        const chunkMap = await translateGeminiChunk(
+          chunks[myIdx],
+          candidateModels,
+          deadModels,
+          apiKey
+        );
+        Object.assign(result, chunkMap);
+      }
+    });
+    await Promise.all(workers);
+  };
+
+  await runChunksInPool(itemsToTranslate, 20, 4);
+
+  const missingItems = itemsToTranslate.filter((it) => !result[it.rowKey]);
+  if (missingItems.length > 0 && missingItems.length < itemsToTranslate.length) {
+    await runChunksInPool(missingItems, 20, 4);
   }
 
-  return {};
+  return result;
 }
 
 export async function POST(request) {
@@ -3536,6 +3836,13 @@ export async function POST(request) {
             : null;
 
         const mergedYearMap = { ...(rRow.rValuesByYear || {}) };
+        const anchorNonZeroVals = Object.values(mergedYearMap).filter(
+          (v) => typeof v === 'number' && v !== 0
+        );
+        const isConsistentlyNegativeAnchorIS =
+          stmtType === 'IS' &&
+          anchorNonZeroVals.length > 0 &&
+          anchorNonZeroVals.every((v) => v < 0);
 
         for (const y of targetYears) {
           if (mergedYearMap[y] !== undefined) continue;
@@ -3567,7 +3874,10 @@ export async function POST(request) {
               candidateVal = 0;
             } else if (stdRule?.sign === 'neg' || polarity === 'OUTFLOW') {
               candidateVal = -Math.abs(scaled);
-            } else if (stdRule?.sign === 'pos' || polarity === 'INFLOW') {
+            } else if (
+              (stdRule?.sign === 'pos' || polarity === 'INFLOW') &&
+              !(isConsistentlyNegativeAnchorIS && scaled < 0)
+            ) {
               candidateVal = Math.abs(scaled);
             } else {
               candidateVal = scaled;
@@ -3850,9 +4160,9 @@ export async function POST(request) {
     if (needsAiList.length > 0) {
       const aiMap = await alignAndTranslateWithGemini(needsAiList, rawSheets, apiKey.trim());
       for (const item of needsAiList) {
-        const aiKor = aiMap[item.rowKey];
+        const aiKor = sanitizeAiKoreanLabel(aiMap[item.rowKey]);
         let baseKor;
-        if (aiKor && !/[a-zA-Z]{4,}/.test(aiKor)) {
+        if (aiKor) {
           baseKor = aiKor;
         } else {
           baseKor = fallbackKoreanLabelBuilder(
