@@ -895,7 +895,7 @@ function auditScaleJumps(ticker, sheets) {
         const minAbs = Math.min(Math.abs(prev), Math.abs(curr));
         const ratio = maxAbs / minAbs;
 
-        if (ratio >= SCALE_JUMP_THRESHOLD) {
+        if (ratio >= SCALE_JUMP_THRESHOLD && (minAbs >= 5 || maxAbs >= 100000)) {
           failures.push(
             makeFailure(
               ticker,

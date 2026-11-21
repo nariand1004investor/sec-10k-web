@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# stress-test temporary outputs
+audit-translations.txt
+audit-report.md

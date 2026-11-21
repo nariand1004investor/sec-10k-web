@@ -1117,7 +1117,20 @@ function classifyCashFlowRowPolarity(tag = '', contextualLabel = '', korName = '
   if (/\bnet\s+change\b|\bincrease\s*\(decrease\)|순증감|증감|기타.*순/i.test(`${lbl} ${kor}`)) {
     return 'NEUTRAL';
   }
+  // 영업·투자활동의 대출채권/대여금 회수성 RepaymentsOf*는 차입금 상환이 아니므로 원표기 부호 유지
+  if (
+    /RepaymentsOf.*(?:Loans|Advances|NotesReceivable)/i.test(t) &&
+    !/\[재무활동\]/i.test(`${lbl} ${kor}`) &&
+    !/(?:Debt|Borrowing|Credit|Bank|TermLoan|LineOfCredit|LongTerm|ShortTerm|Senior|Subordinated)/i.test(
+      t
+    )
+  ) {
+    return 'NEUTRAL';
+  }
 
+  if (/^ProceedsFrom/i.test(t)) {
+    return 'INFLOW';
+  }
   if (
     /^(?:PaymentsToAcquire|PaymentsForRepurchase|PaymentsOfDividends|PaymentsOf|PaymentsFor|PaymentsRelatedTo|PaymentsToMinority|RepaymentsOf|FinanceLeasePrincipalPayments)/i.test(
       t
@@ -1140,9 +1153,6 @@ function classifyCashFlowRowPolarity(tag = '', contextualLabel = '', korName = '
     return 'OUTFLOW';
   }
 
-  if (/^ProceedsFrom/i.test(t)) {
-    return 'INFLOW';
-  }
   if (/^(?:proceeds from|borrowings under|issuance of)/i.test(lbl)) {
     return 'INFLOW';
   }
@@ -1154,6 +1164,12 @@ function classifyCashFlowRowPolarity(tag = '', contextualLabel = '', korName = '
 }
 
 function isMezzanineOrTemporaryEquityRow(tag = '', label = '') {
+  if (
+    tag === 'LiabilitiesAndStockholdersEquity' ||
+    /^total\s+liabilities\b/i.test(String(label || '').trim())
+  ) {
+    return false;
+  }
   return (
     /RedeemableNoncontrollingInterest|TemporaryEquity/i.test(String(tag || '')) ||
     /redeemable\s+noncontrolling|temporary\s+equity|상환가능비지배지분|상환가능지분|메자닌/i.test(
@@ -1410,7 +1426,10 @@ function determineExactTableScaleFromFacts(rows, colYears, factsObj, accessionNu
       if (!matchedRecord) {
         matchedRecord = usdRecords.find((rec) => {
           if (rec.form !== '10-K' && rec.form !== '10-K/A') return false;
-          if (rec.frame && new RegExp(`^CY${yr}(?:Q4)?I?$`).test(rec.frame)) return true;
+          const isEarlyFye = Boolean(
+            rec.end && /^20\d{2}-(?:01-(?:1[6-9]|2\d|3[01])|0[2-5]-\d{2})$/.test(rec.end)
+          );
+          if (!isEarlyFye && rec.frame && new RegExp(`^CY${yr}(?:Q4)?I?$`).test(rec.frame)) return true;
           let endYr = rec.end ? parseInt(rec.end.slice(0, 4), 10) : rec.fy;
           if (rec.end && /^20\d{2}-01-(?:0[1-9]|1[0-5])$/.test(rec.end)) endYr -= 1;
           return endYr === yr;
@@ -1442,8 +1461,181 @@ function determineExactTableScaleFromFacts(rows, colYears, factsObj, accessionNu
   return 0.000001;
 }
 
+function normalizeCorpCoreName(name = '') {
+  return String(name || '')
+    .toUpperCase()
+    .replace(/[/.,'’"&-]+/g, ' ')
+    .replace(
+      /\b(?:INCORPORATED|INC|CORPORATION|CORP|HOLDINGS?|HOLDCO|COMPANY|CO|LIMITED|LTD|LLC|PLC|LP|NV|SA|THE|OF|DELAWARE|NEW)\b/g,
+      ' '
+    )
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+async function extract10KsFromSubmissionsData(subData, headers, maxCount = 12) {
+  const accMap = new Map();
+  const collectFromObj = (obj) => {
+    if (!obj || !Array.isArray(obj.form)) return;
+    for (let i = 0; i < obj.form.length; i++) {
+      if (obj.form[i] === '10-K') {
+        const accn = obj.accessionNumber?.[i];
+        const filed = obj.filingDate?.[i] || '';
+        const repDate = obj.reportDate?.[i] || '';
+        let repYear = repDate
+          ? parseInt(repDate.slice(0, 4), 10)
+          : parseInt(filed.slice(0, 4), 10) - 1;
+        if (repDate && /^20\d{2}-01-(?:0[1-9]|1[0-5])$/.test(repDate)) repYear -= 1;
+        if (accn && !accMap.has(accn)) {
+          accMap.set(accn, { accn, filed, reportYear: repYear });
+        }
+      }
+    }
+  };
+
+  collectFromObj(subData?.filings?.recent);
+
+  const archiveFiles = subData?.filings?.files || [];
+  for (let f = 0; f < archiveFiles.length && accMap.size < maxCount; f++) {
+    const fileName = archiveFiles[f]?.name;
+    if (!fileName) continue;
+    try {
+      const archUrl = makeUrl(['data', 'sec', 'gov'], `submissions/${fileName}`);
+      const archRes = await fetch(archUrl, { headers });
+      if (archRes.ok) {
+        const archData = await archRes.json();
+        collectFromObj(archData);
+      }
+    } catch (e) {}
+  }
+
+  return Array.from(accMap.values()).sort((a, b) => (b.filed || '').localeCompare(a.filed || ''));
+}
+
+async function findVerifiedPredecessor10KCik({
+  targetCik,
+  targetEntityName = '',
+  targetTicker = '',
+  targetSubData = null,
+  headers,
+  requiredMaxReportYear = null,
+}) {
+  try {
+    const rawName = targetSubData?.name || targetEntityName || '';
+    const targetCore = normalizeCorpCoreName(rawName);
+    if (targetCore.length < 4) return null;
+
+    const searchPhrase = String(rawName)
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/[/.,'’"&-]+/g, ' ')
+      .replace(
+        /\b(?:INCORPORATED|INC|CORPORATION|CORP|HOLDINGS?|HOLDCO|COMPANY|CO|LIMITED|LTD|LLC|PLC|THE)\b/gi,
+        ' '
+      )
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!searchPhrase || searchPhrase.length < 3) return null;
+
+    const endDt = requiredMaxReportYear
+      ? `${requiredMaxReportYear + 1}-12-31`
+      : new Date().toISOString().slice(0, 10);
+    const startDt = requiredMaxReportYear
+      ? `${requiredMaxReportYear - 3}-01-01`
+      : `${new Date().getFullYear() - 5}-01-01`;
+
+    const queryUrls = [
+      makeUrl(
+        ['efts', 'sec', 'gov'],
+        `LATEST/search-index?entityName=${encodeURIComponent(searchPhrase)}&forms=10-K&dateRange=custom&startdt=${startDt}&enddt=${endDt}`
+      ),
+      makeUrl(
+        ['efts', 'sec', 'gov'],
+        `LATEST/search-index?q=${encodeURIComponent(`"${searchPhrase}"`)}&forms=10-K&dateRange=custom&startdt=${startDt}&enddt=${endDt}`
+      ),
+    ];
+
+    const testedCiks = new Set([targetCik]);
+    const targetSic = targetSubData?.sic ? String(targetSubData.sic).trim() : '';
+
+    for (const qUrl of queryUrls) {
+      let eftsData = null;
+      try {
+        const res = await fetch(qUrl, { headers });
+        if (!res.ok) continue;
+        eftsData = await res.json();
+      } catch {
+        continue;
+      }
+
+      const hits = eftsData?.hits?.hits || [];
+      const cikCounts = new Map();
+      for (const h of hits) {
+        if (h?._source?.form && h._source.form !== '10-K') continue;
+        const ciks = Array.isArray(h?._source?.ciks) ? h._source.ciks : [];
+        for (const c of ciks) {
+          const padded = String(c).padStart(10, '0');
+          if (testedCiks.has(padded)) continue;
+          cikCounts.set(padded, (cikCounts.get(padded) || 0) + 1);
+        }
+      }
+
+      const rankedCiks = Array.from(cikCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([c]) => c);
+
+      for (const candCik of rankedCiks) {
+        testedCiks.add(candCik);
+        try {
+          const subUrl = makeUrl(['data', 'sec', 'gov'], `submissions/CIK${candCik}.json`);
+          const subRes = await fetch(subUrl, { headers });
+          if (!subRes.ok) continue;
+          const candSub = await subRes.json();
+
+          // 1) SIC 코드 일치 확인 (양측 존재 시)
+          const candSic = candSub?.sic ? String(candSub.sic).trim() : '';
+          if (targetSic && candSic && targetSic !== candSic) continue;
+
+          // 2) 타 상장사 활성 티커 충돌 방지
+          const candTickers = Array.isArray(candSub?.tickers) ? candSub.tickers : [];
+          if (
+            candTickers.length > 0 &&
+            targetTicker &&
+            !candTickers.some((t) => String(t).toUpperCase() === String(targetTicker).toUpperCase())
+          ) {
+            continue;
+          }
+
+          // 3) 현재명 또는 과거 사명(formerNames)의 정규화 핵심 법인명 완전 일치
+          const candNames = [
+            candSub?.name,
+            ...((candSub?.formerNames || []).map((f) => f?.name) || []),
+          ].filter(Boolean);
+          const nameMatched = candNames.some((n) => normalizeCorpCoreName(n) === targetCore);
+          if (!nameMatched) continue;
+
+          // 4) 실제 10-K 공시 보유 확인
+          const filings10K = await extract10KsFromSubmissionsData(candSub, headers, 12);
+          if (filings10K.length === 0) continue;
+          if (
+            requiredMaxReportYear !== null &&
+            !filings10K.some((f) => f.reportYear <= requiredMaxReportYear)
+          ) {
+            continue;
+          }
+
+          return { cik: candCik, subData: candSub, filings10K };
+        } catch {
+          continue;
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
 // 14. 최근 10개년 10-K 공시 목록 추출 (수치 로직 100% 동일)
-async function discoverAll10KFilings(cik, factsObj, headers) {
+async function discoverAll10KFilings(cik, factsObj, headers, preloadedSubData = null) {
   const accMap = new Map();
 
   const usGaap = factsObj?.['us-gaap'] || {};
@@ -1485,38 +1677,16 @@ async function discoverAll10KFilings(cik, factsObj, headers) {
   }
 
   try {
-    const subUrl = makeUrl(['data', 'sec', 'gov'], `submissions/CIK${cik}.json`);
-    const subRes = await fetch(subUrl, { headers });
-    if (subRes.ok) {
-      const subData = await subRes.json();
-      const collectFromRecentObj = (recentObj) => {
-        if (!recentObj || !Array.isArray(recentObj.form)) return;
-        for (let i = 0; i < recentObj.form.length; i++) {
-          if (recentObj.form[i] === '10-K') {
-            const accn = recentObj.accessionNumber[i];
-            const filed = recentObj.filingDate?.[i] || '';
-            const repDate = recentObj.reportDate?.[i] || '';
-            let repYear = repDate ? parseInt(repDate.slice(0, 4), 10) : parseInt(filed.slice(0, 4), 10) - 1;
-            if (repDate && /^20\d{2}-01-(?:0[1-9]|1[0-5])$/.test(repDate)) repYear -= 1;
-            if (accn && !accMap.has(accn)) {
-              accMap.set(accn, { accn, filed, reportYear: repYear });
-            }
-          }
-        }
-      };
-
-      collectFromRecentObj(subData?.filings?.recent);
-
-      const archiveFiles = subData?.filings?.files || [];
-      for (let f = 0; f < archiveFiles.length && accMap.size < 11; f++) {
-        const fileName = archiveFiles[f]?.name;
-        if (!fileName) continue;
-        const archUrl = makeUrl(['data', 'sec', 'gov'], `submissions/${fileName}`);
-        const archRes = await fetch(archUrl, { headers });
-        if (archRes.ok) {
-          const archData = await archRes.json();
-          collectFromRecentObj(archData);
-        }
+    let subData = preloadedSubData;
+    if (!subData) {
+      const subUrl = makeUrl(['data', 'sec', 'gov'], `submissions/CIK${cik}.json`);
+      const subRes = await fetch(subUrl, { headers });
+      if (subRes.ok) subData = await subRes.json();
+    }
+    if (subData) {
+      const sub10Ks = await extract10KsFromSubmissionsData(subData, headers, 11);
+      for (const item of sub10Ks) {
+        if (!accMap.has(item.accn)) accMap.set(item.accn, item);
       }
     }
   } catch (e) {}
@@ -1695,6 +1865,9 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
       let currentSection = '';
       let cfCashBalanceCount = 0;
       let inRestatementBlock = false;
+      let inOtherEntityBlock = false;
+      let afterMainLse = false;
+      const postLseDebtRows = [];
 
       // 다차원 복합 지주사(ProductOrServiceAxis 부문 손익·BS·CF가 실제로 존재하는 기업) 전용 플래그
       // AAPL·CME 등 매출 세분화/주식종류만 있는 단일 기업에서는 반드시 false -> 기존 5종목 회귀 0건 보장
@@ -1735,7 +1908,8 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
       let nonSegMember = '';
       let nonSegBlockAbstract = '';
 
-      for (const tr of trBlocks) {
+      for (let trIdx = 0; trIdx < trBlocks.length; trIdx++) {
+        const tr = trBlocks[trIdx];
         if (/<th[\s>]/i.test(tr)) continue;
 
         let rawLabel = '';
@@ -1758,6 +1932,7 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
         if (!hasNumericCell) {
           if (/RestatementAxis/i.test(tr) || /^restated\s+balance$/i.test(rawLabel)) {
             inRestatementBlock = true;
+            inOtherEntityBlock = false;
             if (isMultiSegmentTable) {
               currentDimAxis = '';
               currentDimMember = '';
@@ -1770,6 +1945,15 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
             continue;
           } else if (/class=["']rh["']/i.test(tr) || /Axis/i.test(tr)) {
             inRestatementBlock = false;
+            // 복합공시(Combined 10-K, 예: NEE + 자회사 FPL)의 자회사 LegalEntityAxis/OperatingSegments 블록 격리
+            inOtherEntityBlock =
+              rows.length > 0 &&
+              /(?:LegalEntityAxis|ConsolidatedEntitiesAxis|EntityNameAxis|ConsolidationItemsAxis|StatementBusinessSegmentsAxis)/i.test(
+                tr
+              );
+            if (inOtherEntityBlock) {
+              continue;
+            }
             if (isMultiSegmentTable && /class=["']rh["']/i.test(tr)) {
               if (/ProductOrServiceAxis/i.test(tr)) {
                 currentDimAxis = 'ProductOrServiceAxis';
@@ -1884,6 +2068,10 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
           }
         }
 
+        if (inOtherEntityBlock) {
+          continue;
+        }
+
         if (isExcludedGrossOrAccumRow(stmtType, tag, rawLabel)) {
           continue;
         }
@@ -1957,6 +2145,16 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
 
         const authMeta =
           xbrlAuthMap[fullDefKey] || xbrlAuthMap[`defref_${prefix}_${tag}`] || {};
+
+        if (
+          /percentItemType|pureItemType/i.test(authMeta.dataType || '') ||
+          /Percentage$/i.test(tag || '') ||
+          (stmtType === 'BS' &&
+            (/perShareItemType/i.test(authMeta.dataType || '') ||
+              /ParOrStatedValuePerShare$/i.test(tag || '')))
+        ) {
+          continue;
+        }
 
         const rowType = detectRowType(tag, cleanLabel, currentSection, stmtType, authMeta.dataType);
         const contextualLabel = isDebtOpRow
@@ -2042,7 +2240,7 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
           ? `CF_CASH_${thisCashIndex}`
           : debtDimKey || effectiveDimMember || dimKey;
 
-        rows.push({
+        const parsedRowObj = {
           prefix,
           tag,
           dimAxis: isMultiSegmentTable ? currentDimAxis : '',
@@ -2062,7 +2260,16 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
           isTotalRow,
           rawNumbersByYear,
           rValuesByYear: {},
-        });
+        };
+
+        if (afterMainLse) {
+          if (nonSegAxis === 'ProductOrServiceAxis' && /LongTermDebt/i.test(tag) && rowType === 'USD') {
+            postLseDebtRows.push(parsedRowObj);
+          }
+          continue;
+        }
+
+        rows.push(parsedRowObj);
 
         if (
           stmtType === 'BS' &&
@@ -2072,7 +2279,14 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
               cleanLabel
             ))
         ) {
-          break;
+          const remainingTrs = trBlocks.slice(trIdx + 1);
+          const hasRemainingSegDebt =
+            remainingTrs.some((t) => /ProductOrServiceAxis/i.test(t)) &&
+            remainingTrs.some((t) => /LongTermDebt/i.test(t));
+          if (!hasRemainingSegDebt) {
+            break;
+          }
+          afterMainLse = true;
         }
       }
 
@@ -2127,10 +2341,22 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
               cfTableHasNegatives &&
               r.tag === 'PaymentsToAcquireBusinessesNetOfCashAcquired' &&
               signedNum > 0;
+            const isNetProceedsOutflow =
+              stmtType === 'CF' &&
+              cfTableHasNegatives &&
+              polarity === 'INFLOW' &&
+              /^(?:ProceedsFromDivestitureOfBusinessesNetOfCashDivested|ProceedsFromIssuanceOrSaleOfEquity)$|NetOfCashDivested/i.test(
+                r.tag
+              ) &&
+              signedNum < 0;
             if (isNetAcqInflow) {
               val = Math.abs(val);
               if (!r.netAcquisitionInflowYears) r.netAcquisitionInflowYears = new Set();
               r.netAcquisitionInflowYears.add(String(yr));
+            } else if (isNetProceedsOutflow) {
+              val = -Math.abs(val);
+              if (!r.netProceedsOutflowYears) r.netProceedsOutflowYears = new Set();
+              r.netProceedsOutflowYears.add(String(yr));
             } else if (val !== 0 && polarity === 'OUTFLOW') {
               val = -Math.abs(val);
             } else if (val !== 0 && polarity === 'INFLOW') {
@@ -2142,8 +2368,187 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
         delete r.rawNumbersByYear;
       }
 
-      // 다차원 복합 지주사(BRK-A 등) 단일 10-K 구조 재배치 (수치 확정 후 / 소계 검산 전)
       const latestColYr = colYears[0];
+
+      // BS 총부채·자본합계(LSE) 이후 ProductOrServiceAxis로 분리 공시된 유동·비유동 장기차입금 복원 (CAT 등)
+      if (stmtType === 'BS' && postLseDebtRows.length > 0 && latestColYr !== undefined) {
+        for (const pr of postLseDebtRows) {
+          for (const [yr, signedNum] of Object.entries(pr.rawNumbersByYear)) {
+            pr.rValuesByYear[yr] = Math.round(signedNum * verifiedDollarScale);
+          }
+          delete pr.rawNumbersByYear;
+        }
+
+        const groupedByTag = new Map();
+        for (let pi = 0; pi < postLseDebtRows.length; pi++) {
+          const pr = postLseDebtRows[pi];
+          if (!pr.tag) continue;
+          if (!groupedByTag.has(pr.tag)) {
+            groupedByTag.set(pr.tag, { sample: pr, byYear: {}, seenMembersByYear: {} });
+          }
+          const g = groupedByTag.get(pr.tag);
+          const memKey = pr.nonSegMember || pr.dimKey || String(pi);
+          for (const [yr, val] of Object.entries(pr.rValuesByYear)) {
+            if (typeof val !== 'number') continue;
+            if (!g.seenMembersByYear[yr]) g.seenMembersByYear[yr] = new Set();
+            if (g.seenMembersByYear[yr].has(memKey)) continue;
+            g.seenMembersByYear[yr].add(memKey);
+            g.byYear[yr] = (g.byYear[yr] || 0) + val;
+          }
+        }
+
+        const currentDebtTags = ['LongTermDebtAndCapitalLeaseObligationsCurrent', 'LongTermDebtCurrent'];
+        const liabCurrIdx = rows.findIndex((r) => r.tag === 'LiabilitiesCurrent' && !r.dimKey);
+        if (
+          liabCurrIdx !== -1 &&
+          !rows.some((r) => !r.dimKey && currentDebtTags.includes(r.tag))
+        ) {
+          for (const cTag of currentDebtTags) {
+            const g = groupedByTag.get(cTag);
+            if (!g || g.byYear[latestColYr] === undefined) continue;
+            let clStart = 0;
+            for (let i = liabCurrIdx - 1; i >= 0; i--) {
+              if (rows[i].isTotalRow && rows[i].rowType === 'USD') {
+                clStart = i + 1;
+                break;
+              }
+            }
+            let compSum = 0;
+            for (let i = clStart; i < liabCurrIdx; i++) {
+              if (rows[i].rowType === 'USD' && !rows[i].isTotalRow && !rows[i].dimKey) {
+                compSum += rows[i].rValuesByYear[latestColYr] || 0;
+              }
+            }
+            const clVal = rows[liabCurrIdx].rValuesByYear[latestColYr];
+            if (clVal !== undefined) {
+              const gapBefore = Math.abs(clVal - compSum);
+              const gapAfter = Math.abs(clVal - (compSum + g.byYear[latestColYr]));
+              if (gapBefore > 3 && gapAfter <= 3) {
+                const s = g.sample;
+                rows.splice(liabCurrIdx, 0, {
+                  prefix: s.prefix,
+                  tag: s.tag,
+                  dimAxis: '',
+                  dimMember: '',
+                  blockAbstract: '',
+                  nonSegAxis: '',
+                  nonSegMember: '',
+                  nonSegBlockAbstract: '',
+                  dimKey: '',
+                  isMainRow: true,
+                  rowType: 'USD',
+                  isEps: false,
+                  companyLabel: s.companyLabel,
+                  contextualLabel: s.companyLabel,
+                  normLabel: s.normLabel,
+                  normContextualLabel: s.normLabel,
+                  isTotalRow: false,
+                  rValuesByYear: g.byYear,
+                });
+                break;
+              }
+            }
+          }
+        }
+
+        const nonCurrDebtTags = [
+          'LongTermDebtAndCapitalLeaseObligations',
+          'LongTermDebtNoncurrent',
+          'LongTermDebt',
+        ];
+        const updatedLiabCurrIdx = rows.findIndex((r) => r.tag === 'LiabilitiesCurrent' && !r.dimKey);
+        const updatedLiabIdx = rows.findIndex((r) => r.tag === 'Liabilities' && !r.dimKey);
+        if (
+          updatedLiabCurrIdx !== -1 &&
+          updatedLiabIdx > updatedLiabCurrIdx &&
+          !rows.some((r) => !r.dimKey && nonCurrDebtTags.includes(r.tag))
+        ) {
+          for (const ncTag of nonCurrDebtTags) {
+            const g = groupedByTag.get(ncTag);
+            if (!g || g.byYear[latestColYr] === undefined) continue;
+            const clVal = rows[updatedLiabCurrIdx].rValuesByYear[latestColYr];
+            const liabVal = rows[updatedLiabIdx].rValuesByYear[latestColYr];
+            if (clVal === undefined || liabVal === undefined) continue;
+            let nonCurrSum = 0;
+            for (let i = updatedLiabCurrIdx + 1; i < updatedLiabIdx; i++) {
+              if (rows[i].rowType === 'USD' && !rows[i].isTotalRow && !rows[i].dimKey) {
+                nonCurrSum += rows[i].rValuesByYear[latestColYr] || 0;
+              }
+            }
+            const gapBefore = Math.abs(liabVal - (clVal + nonCurrSum));
+            const gapAfter = Math.abs(liabVal - (clVal + nonCurrSum + g.byYear[latestColYr]));
+            if (gapBefore > 3 && gapAfter <= 3) {
+              const s = g.sample;
+              rows.splice(updatedLiabIdx, 0, {
+                prefix: s.prefix,
+                tag: s.tag,
+                dimAxis: '',
+                dimMember: '',
+                blockAbstract: '',
+                nonSegAxis: '',
+                nonSegMember: '',
+                nonSegBlockAbstract: '',
+                dimKey: '',
+                isMainRow: true,
+                rowType: 'USD',
+                isEps: false,
+                companyLabel: s.companyLabel,
+                contextualLabel: s.companyLabel,
+                normLabel: s.normLabel,
+                normContextualLabel: s.normLabel,
+                isTotalRow: false,
+                rValuesByYear: g.byYear,
+              });
+              break;
+            }
+          }
+        }
+      }
+
+      // BS 재고자산 세부 구성항목(원재료/재공품/완제품) + 합계(InventoryNet) 동시 공시 중복 제거 (PG, SHW 2016 등)
+      if (stmtType === 'BS' && !hasSegmentBS && rows.length > 2) {
+        const invNetIdx = rows.findIndex((r) => r.tag === 'InventoryNet' && !r.dimKey);
+        if (invNetIdx >= 2) {
+          const subIndices = [];
+          for (let k = invNetIdx - 1; k >= 0; k--) {
+            if (rows[k].dimKey || rows[k].isTotalRow || rows[k].rowType !== 'USD') break;
+            if (
+              /^Inventory(?:RawMaterials|WorkInProcess|FinishedGoods|Parts|Supplies|LIFO|Reserve|Valuation)/i.test(
+                rows[k].tag || ''
+              )
+            ) {
+              subIndices.push(k);
+            } else {
+              break;
+            }
+          }
+          if (subIndices.length >= 2) {
+            const invNetRow = rows[invNetIdx];
+            let overlapCount = 0;
+            let allMatch = true;
+            for (const yr of colYears) {
+              const totVal = invNetRow.rValuesByYear[yr];
+              if (totVal === undefined) continue;
+              const subVals = subIndices
+                .map((si) => rows[si].rValuesByYear[yr])
+                .filter((v) => typeof v === 'number');
+              if (subVals.length < 2) continue;
+              overlapCount++;
+              const subSum = subVals.reduce((a, b) => a + b, 0);
+              if (Math.abs(subSum - totVal) > 3) {
+                allMatch = false;
+                break;
+              }
+            }
+            if (overlapCount > 0 && allMatch) {
+              const removeSet = new Set(subIndices);
+              rows = rows.filter((_, idx) => !removeSet.has(idx));
+            }
+          }
+        }
+      }
+
+      // 다차원 복합 지주사(BRK-A 등) 단일 10-K 구조 재배치 (수치 확정 후 / 소계 검산 전)
       if (hasSegmentCF && latestColYr !== undefined) {
         const segFinRows = rows.filter((r) => r.dimAxis === 'ProductOrServiceAxis');
         const mainRows = rows.filter((r) => r.dimAxis !== 'ProductOrServiceAxis');
@@ -2778,6 +3183,24 @@ function isSingleYearRedundantByReconciliation(
     return errWithout <= 4 && errWith > errWithout + 2;
   }
 
+  if (stmtType === 'IS' && !isSegSubtotal && isTargetAlreadyInRows) {
+    const targetRow = rows[targetPos];
+    const isTopLineRevenue = [
+      'Revenues',
+      'SalesRevenueNet',
+      'RevenueFromContractWithCustomerExcludingAssessedTax',
+      'RevenueFromContractWithCustomerIncludingAssessedTax',
+      'RegulatedAndUnregulatedOperatingRevenue',
+    ].includes(targetRow?.tag);
+    const isCostTotal =
+      subTotalRow.tag === 'CostsAndExpenses' ||
+      subTotalRow.tag === 'OperatingExpenses' ||
+      /costs?|expenses?/i.test(subTotalRow.companyLabel || '');
+    if (isTopLineRevenue && isCostTotal) {
+      return false;
+    }
+  }
+
   const candidatesWithout = [Math.abs(sumWithout - subVal)];
   const candidatesWith = [Math.abs(sumWith - subVal)];
 
@@ -2804,9 +3227,14 @@ function isSingleYearRedundantByReconciliation(
 }
 
 // 17. 5단계 멀티패스 매칭 + 연도별 소계 항등식 필터링 엔진 (MSA Safety 버전과 100% 동일하게 고정!)
-async function fetchMultiYear10KStructure(cik, factsObj, headers) {
+async function fetchMultiYear10KStructure(cik, factsObj, headers, options = {}) {
   try {
-    const all10Ks = await discoverAll10KFilings(cik, factsObj, headers);
+    const all10Ks = await discoverAll10KFilings(
+      cik,
+      factsObj,
+      headers,
+      options.preloadedSubData || null
+    );
     if (all10Ks.length === 0) return null;
 
     const cikUnpadded = String(parseInt(cik, 10));
@@ -2821,6 +3249,65 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
       for (const res of results) {
         if (res && (res.IS?.length || res.BS?.length || res.CF?.length)) {
           parsedFilings.push(res);
+        }
+      }
+    }
+
+    // 지주사 재편 등으로 IS보다 BS 공시 시작연도가 늦고 10년 미만인 경우(예: DIS 2017 BS),
+    // 엄격히 검증된 승계 전 법인 CIK의 과거 10-K를 추가 병합 (기존 10년 완료/단독 IPO 기업은 미실행)
+    if (all10Ks.length < 10 && parsedFilings.length > 0 && options.targetSubData) {
+      const isYears = [];
+      const bsYears = [];
+      for (const pf of parsedFilings) {
+        for (const r of pf.IS || []) {
+          for (const y of Object.keys(r.rValuesByYear || {})) isYears.push(Number(y));
+        }
+        for (const r of pf.BS || []) {
+          if (r.tag === 'Assets' || r.tag === 'LiabilitiesAndStockholdersEquity') {
+            for (const y of Object.keys(r.rValuesByYear || {})) bsYears.push(Number(y));
+          }
+        }
+      }
+      const minIsYr = isYears.length ? Math.min(...isYears) : Infinity;
+      const minBsYr = bsYears.length ? Math.min(...bsYears) : Infinity;
+      if (minIsYr < minBsYr && minBsYr < Infinity) {
+        const pred = await findVerifiedPredecessor10KCik({
+          targetCik: cik,
+          targetEntityName: options.targetEntityName || '',
+          targetTicker: options.targetTicker || '',
+          targetSubData: options.targetSubData,
+          headers,
+          requiredMaxReportYear: minBsYr - 1,
+        });
+        if (pred) {
+          let predFactsObj = factsObj;
+          try {
+            const pfRes = await fetch(
+              makeUrl(['data', 'sec', 'gov'], `api/xbrl/companyfacts/CIK${pred.cik}.json`),
+              { headers }
+            );
+            if (pfRes.ok) {
+              const pfData = await pfRes.json();
+              if (pfData?.facts) predFactsObj = pfData.facts;
+            }
+          } catch {}
+          const seenAccns = new Set(all10Ks.map((f) => f.accn));
+          const extra10Ks = pred.filings10K
+            .filter((f) => !seenAccns.has(f.accn) && f.reportYear <= minBsYr)
+            .slice(0, Math.max(1, 10 - all10Ks.length));
+          const predCikUnpadded = String(parseInt(pred.cik, 10));
+          for (let i = 0; i < extra10Ks.length; i += 4) {
+            if (i > 0) await delay(120);
+            const batch = extra10Ks.slice(i, i + 4);
+            const results = await Promise.all(
+              batch.map((f) => fetchSingle10KRStatements(predCikUnpadded, f.accn, predFactsObj, headers))
+            );
+            for (const res of results) {
+              if (res && (res.IS?.length || res.BS?.length || res.CF?.length)) {
+                parsedFilings.push(res);
+              }
+            }
+          }
         }
       }
     }
@@ -2900,8 +3387,41 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
                 }
                 targetAnchor.netAcquisitionInflowYears.add(String(yr));
               }
+              if (sourceOlder.netProceedsOutflowYears?.has(String(yr))) {
+                if (!targetAnchor.netProceedsOutflowYears) {
+                  targetAnchor.netProceedsOutflowYears = new Set();
+                }
+                targetAnchor.netProceedsOutflowYears.add(String(yr));
+              }
             }
           }
+        };
+
+        const getCfActivitySection = (rowsList, rowIdx) => {
+          if (stmtType !== 'CF') return 'OTHER';
+          if (rowsList[rowIdx]?.isTotalRow) return 'OTHER';
+          for (let i = rowIdx; i < rowsList.length; i++) {
+            const r = rowsList[i];
+            if (r.dimAxis === 'ProductOrServiceAxis' && r.dimMember) continue;
+            if (!r.isTotalRow || r.rowType !== 'USD') continue;
+            const t = r.tag || '';
+            const l = r.companyLabel || '';
+            if (/OperatingActivities/i.test(t) || /operating activities/i.test(l)) return 'OPERATING';
+            if (/InvestingActivities/i.test(t) || /investing activities/i.test(l)) return 'INVESTING';
+            if (/FinancingActivities/i.test(t) || /financing activities/i.test(l)) return 'FINANCING';
+            return 'OTHER';
+          }
+          return 'OTHER';
+        };
+        const olderCfSectionCache = olderRows.map((_, i) => getCfActivitySection(olderRows, i));
+        const anchorCfSectionCache = anchorRows.map((_, i) => getCfActivitySection(anchorRows, i));
+        const isSameCfSection = (oIdx, aIdx) => {
+          if (stmtType !== 'CF') return true;
+          if (olderRows[oIdx]?.isTotalRow || anchorRows[aIdx]?.isTotalRow) return true;
+          const oSec = olderCfSectionCache[oIdx] || 'OTHER';
+          const aSec = anchorCfSectionCache[aIdx] || 'OTHER';
+          if (oSec === 'OTHER' || aSec === 'OTHER') return true;
+          return oSec === aSec;
         };
 
         // [Pass 1] 태그 + 차원(dimKey/dimMember) + 문맥라벨 + rowType 완전 일치
@@ -2912,6 +3432,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               !(or.nonSegAxis && !ar.nonSegAxis) &&
               ar.rowType === or.rowType &&
               ar.tag === or.tag &&
@@ -2930,6 +3451,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               ar.rowType === or.rowType &&
               (ar.dimMember || '') === or.dimMember &&
               ar.tag === or.tag &&
@@ -2946,6 +3468,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               ar.rowType === or.rowType &&
               ar.tag === or.tag &&
               ar.dimKey === or.dimKey
@@ -2961,6 +3484,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               !(or.nonSegAxis && !ar.nonSegAxis) &&
               ar.rowType === or.rowType &&
               ar.isMainRow &&
@@ -2977,6 +3501,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               !(or.nonSegAxis && !ar.nonSegAxis) &&
               ar.rowType === or.rowType &&
               (ar.dimMember || '') === (or.dimMember || '') &&
@@ -2994,6 +3519,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               !(or.nonSegAxis && !ar.nonSegAxis) &&
               ar.rowType === or.rowType &&
               (ar.dimMember || '') === (or.dimMember || '') &&
@@ -3020,6 +3546,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               !(or.nonSegAxis && !ar.nonSegAxis) &&
               ar.rowType === or.rowType &&
               ar.isMainRow &&
@@ -3040,6 +3567,7 @@ async function fetchMultiYear10KStructure(cik, factsObj, headers) {
           const aIdx = anchorRows.findIndex(
             (ar, idx) =>
               !usedAnchorIndices.has(idx) &&
+              isSameCfSection(oIdx, idx) &&
               ar.rowType === or.rowType &&
               (ar.dimMember || '') === or.dimMember &&
               ar.isTotalRow === or.isTotalRow &&
@@ -3302,7 +3830,15 @@ function determineTenYearWindow(usGaap, actualStructure) {
     if (!Array.isArray(usdList)) continue;
     for (const r of usdList) {
       if (r.form === '10-K' || r.form === '10-K/A') {
-        if (r.frame) {
+        const isEarlyFye = Boolean(
+          r.end && /^20\d{2}-(?:01-(?:1[6-9]|2\d|3[01])|0[2-5]-\d{2})$/.test(r.end)
+        );
+        if (isEarlyFye) {
+          const fm = r.frame ? r.frame.match(/^CY\d{4}(Q\d)?(I)?$/) : null;
+          if (!fm || !fm[1] || fm[1] === 'Q4') {
+            yearsSet.add(parseInt(r.end.slice(0, 4), 10));
+          }
+        } else if (r.frame) {
           const m = r.frame.match(/^CY(\d{4})/);
           if (m) yearsSet.add(parseInt(m[1], 10));
         } else if (r.fy) {
@@ -3366,13 +3902,18 @@ function extract10YearSeriesForTag(factsObj, prefix, tag, targetYears, stmtType,
         if (days < 250 || days > 400) return false;
       }
 
+      const isEarlyFye = Boolean(
+        r.end && /^20\d{2}-(?:01-(?:1[6-9]|2\d|3[01])|0[2-5]-\d{2})$/.test(r.end)
+      );
       if (r.frame) {
         const m = r.frame.match(/^CY(\d{4})(Q\d)?(I)?$/);
         if (m) {
           const frameYear = parseInt(m[1], 10);
           const qStr = m[2];
           if (qStr && qStr !== 'Q4') return false;
-          return frameYear === year;
+          if (!isEarlyFye) {
+            return frameYear === year;
+          }
         }
       }
 
@@ -4057,8 +4598,48 @@ export async function POST(request) {
       );
     }
 
-    const cik = String(matched.cik_str).padStart(10, '0');
+    let cik = String(matched.cik_str).padStart(10, '0');
     const entityName = matched.title || matched.ticker;
+
+    // 1-1. Submissions 사전 확인: 해외기업 20-F/40-F 조기 차단 및 지주사 재편 승계 전 법인 CIK 폴백(XOM 등)
+    let subData = null;
+    try {
+      const subUrl = makeUrl(['data', 'sec', 'gov'], `submissions/CIK${cik}.json`);
+      const subRes = await fetch(subUrl, { headers });
+      if (subRes.ok) {
+        subData = await subRes.json();
+      }
+    } catch {}
+
+    const recentForms = subData?.filings?.recent?.form || [];
+    const has10KInRecent = recentForms.some((f) => /^10-K(?:\/A)?$/i.test(f));
+    const has20FInRecent = recentForms.some((f) => /^(?:20-F|40-F)(?:\/A)?$/i.test(f));
+    if (!has10KInRecent && has20FInRecent) {
+      return NextResponse.json(
+        {
+          error: `'${entityName}'(${query})은(는) 미국 국내기업(10-K)이 아닌 해외 상장기업(SEC 20-F/40-F 공시 대상)으로, 본 10-K 재무제표 자동 추출 대상에서 제외됩니다.`,
+        },
+        { status: 422 }
+      );
+    }
+
+    if (!has10KInRecent && subData) {
+      const existing10Ks = await extract10KsFromSubmissionsData(subData, headers, 1);
+      if (existing10Ks.length === 0) {
+        const pred = await findVerifiedPredecessor10KCik({
+          targetCik: cik,
+          targetEntityName: entityName,
+          targetTicker: query,
+          targetSubData: subData,
+          headers,
+          requiredMaxReportYear: null,
+        });
+        if (pred) {
+          cik = pred.cik;
+          subData = pred.subData;
+        }
+      }
+    }
 
     // 2. CompanyFacts JSON 로드 후 10년 치 10-K R*.htm 전체 병합 (수치 로직 100% 동일)
     const factsUrl = makeUrl(['data', 'sec', 'gov'], `api/xbrl/companyfacts/CIK${cik}.json`);
@@ -4071,7 +4652,12 @@ export async function POST(request) {
     const factsObj = factsData?.facts || {};
     const usGaap = factsObj['us-gaap'] || {};
 
-    const actualStructure = await fetchMultiYear10KStructure(cik, factsObj, headers);
+    const actualStructure = await fetchMultiYear10KStructure(cik, factsObj, headers, {
+      preloadedSubData: subData,
+      targetSubData: subData,
+      targetEntityName: entityName,
+      targetTicker: query,
+    });
 
     // 3. 최근 보고된 10-K 기준 10개년도 범위 산출 (수치 로직 100% 동일)
     const targetYears = determineTenYearWindow(usGaap, actualStructure);
@@ -4131,6 +4717,8 @@ export async function POST(request) {
             : null;
 
         const mergedYearMap = { ...(rRow.rValuesByYear || {}) };
+        const backfilledYears = new Set();
+        const netProceedsOutflowYears = new Set(rRow.netProceedsOutflowYears || []);
         const anchorNonZeroVals = Object.values(mergedYearMap).filter(
           (v) => typeof v === 'number' && v !== 0
         );
@@ -4165,8 +4753,17 @@ export async function POST(request) {
             candidateVal = Math.round(s);
           } else {
             const scaled = Math.round(rawFactVal / 1e6);
+            const isBackfillNetProceedsOutflow =
+              stmtType === 'CF' &&
+              scaled < 0 &&
+              /^(?:ProceedsFromDivestitureOfBusinessesNetOfCashDivested|ProceedsFromIssuanceOrSaleOfEquity)$|NetOfCashDivested/i.test(
+                rRow.tag
+              );
             if (scaled === 0) {
               candidateVal = 0;
+            } else if (isBackfillNetProceedsOutflow) {
+              candidateVal = scaled;
+              netProceedsOutflowYears.add(String(y));
             } else if (stdRule?.sign === 'neg' || polarity === 'OUTFLOW') {
               candidateVal = -Math.abs(scaled);
             } else if (
@@ -4199,6 +4796,7 @@ export async function POST(request) {
           }
 
           mergedYearMap[y] = candidateVal;
+          backfilledYears.add(String(y));
         }
 
         if (stmtType === 'CF' && rRow.rowType === 'USD') {
@@ -4210,7 +4808,9 @@ export async function POST(request) {
                 mergedYearMap[y] = -Math.abs(v);
               }
             } else if (stdRule?.sign === 'pos' || polarity === 'INFLOW') {
-              mergedYearMap[y] = Math.abs(v);
+              if (!netProceedsOutflowYears.has(String(y))) {
+                mergedYearMap[y] = Math.abs(v);
+              }
             }
           }
         }
@@ -4219,6 +4819,8 @@ export async function POST(request) {
           ...rRow,
           rowKey,
           stdRule,
+          backfilledYears,
+          netProceedsOutflowYears,
           rValuesByYear: mergedYearMap,
         };
       });
@@ -4256,8 +4858,19 @@ export async function POST(request) {
           .slice(-2)
           .some((y) => rRow.rValuesByYear[y] !== undefined);
 
-        if (!hasRecentPresence && !rRow.isTotalRow && rRow.rowType === 'USD') {
+        if (!rRow.isTotalRow && rRow.rowType === 'USD') {
           for (const y of targetYears) {
+            const isDisconnectedOlderCfYear =
+              stmtType === 'CF' &&
+              y < targetYears[targetYears.length - 2] &&
+              rRow.rValuesByYear[y + 1] === undefined;
+            if (
+              hasRecentPresence &&
+              !rRow.backfilledYears?.has(String(y)) &&
+              !isDisconnectedOlderCfYear
+            ) {
+              continue;
+            }
             const val = rRow.rValuesByYear[y];
             if (val === undefined || val === null) continue;
             if (
@@ -4279,8 +4892,67 @@ export async function POST(request) {
 
       autoFixRowSignsBySubtotalReconciliation(enrichedRows, targetYears, stmtType);
 
+      if (stmtType === 'CF') {
+        for (let idx = 0; idx < enrichedRows.length; idx++) {
+          const rRow = enrichedRows[idx];
+          if (rRow.isTotalRow || rRow.rowType !== 'USD') continue;
+          const hasRecentPresence = targetYears
+            .slice(-2)
+            .some((y) => rRow.rValuesByYear[y] !== undefined);
+          for (const y of targetYears) {
+            const isDisconnectedOlderCfYear =
+              y < targetYears[targetYears.length - 2] &&
+              rRow.rValuesByYear[y + 1] === undefined;
+            if (
+              hasRecentPresence &&
+              !rRow.backfilledYears?.has(String(y)) &&
+              !isDisconnectedOlderCfYear
+            ) {
+              continue;
+            }
+            const val = rRow.rValuesByYear[y];
+            if (val === undefined || val === null) continue;
+            if (
+              isSingleYearRedundantByReconciliation(
+                enrichedRows,
+                idx,
+                String(y),
+                val,
+                stmtType,
+                true,
+                rRow.dimMember || ''
+              )
+            ) {
+              delete rRow.rValuesByYear[y];
+            }
+          }
+        }
+      }
+
       if (stmtType === 'BS') {
         const assetsRow = enrichedRows.find((r) => r.tag === 'Assets' && !r.dimMember);
+        const lseRow = enrichedRows.find(
+          (r) =>
+            (r.tag === 'LiabilitiesAndStockholdersEquity' ||
+              /^total liabilities and (?:stockholders|shareholders)'? equity$|^total liabilities and equity$/i.test(
+                r.companyLabel || ''
+              )) &&
+            !r.dimMember
+        );
+        // 상장 전(Pre-IPO) 연도 등 BS 본표 자체가 없는 연도에 CompanyFacts 부주석 잔여 셀만 유입되는 현상 차단 (DUOL 2019 등)
+        if (assetsRow || lseRow) {
+          for (const y of targetYears) {
+            if (
+              assetsRow?.rValuesByYear?.[y] === undefined &&
+              lseRow?.rValuesByYear?.[y] === undefined
+            ) {
+              for (const r of enrichedRows) {
+                if (r.rValuesByYear) delete r.rValuesByYear[y];
+              }
+            }
+          }
+        }
+
         const liabRow = enrichedRows.find(
           (r) =>
             (r.tag === 'Liabilities' || r.tag === 'LiabilitiesIncludingDeferredIncomeTaxes') &&
@@ -4293,6 +4965,15 @@ export async function POST(request) {
         const nciRow = enrichedRows.find((r) => r.tag === 'MinorityInterest');
         const mezzRows = enrichedRows.filter((r) =>
           isMezzanineOrTemporaryEquityRow(r.tag, r.contextualLabel)
+        );
+        const capRow = enrichedRows.find(
+          (r) =>
+            (r.tag === 'CapitalizationLongtermDebtAndEquity' ||
+              /^total\s+capitalization$/i.test(r.companyLabel || '')) &&
+            !r.dimMember
+        );
+        const liabCurrRow = enrichedRows.find(
+          (r) => r.tag === 'LiabilitiesCurrent' && !r.dimMember
         );
 
         if (totalEqRow && parentEqRow) {
@@ -4313,6 +4994,43 @@ export async function POST(request) {
               ) {
                 totalEqRow.rValuesByYear[y] = parentEqRow.rValuesByYear[y];
               }
+            }
+          }
+        }
+
+        // 유틸리티(Capitalization 포맷 등) 과거 공시에서 부채총계 행이 생략된 연도 보완 (NEE 2016~2018 등)
+        for (const y of targetYears) {
+          const aVal = assetsRow?.rValuesByYear?.[y];
+          const lseVal = lseRow?.rValuesByYear?.[y];
+          const hasUtilityOrFullBs =
+            capRow?.rValuesByYear?.[y] !== undefined ||
+            (aVal !== undefined &&
+              lseVal !== undefined &&
+              Math.abs(lseVal - aVal) <= 3 &&
+              liabCurrRow?.rValuesByYear?.[y] !== undefined);
+
+          if (
+            hasUtilityOrFullBs &&
+            totalEqRow &&
+            parentEqRow &&
+            nciRow &&
+            totalEqRow.rValuesByYear[y] === undefined &&
+            parentEqRow.rValuesByYear[y] !== undefined &&
+            nciRow.rValuesByYear[y] !== undefined
+          ) {
+            totalEqRow.rValuesByYear[y] =
+              parentEqRow.rValuesByYear[y] + nciRow.rValuesByYear[y];
+          }
+
+          if (liabRow && liabRow.rValuesByYear[y] === undefined && aVal !== undefined && hasUtilityOrFullBs) {
+            const eqVal =
+              totalEqRow?.rValuesByYear?.[y] ??
+              (parentEqRow?.rValuesByYear?.[y] !== undefined
+                ? parentEqRow.rValuesByYear[y] + (nciRow?.rValuesByYear?.[y] ?? 0)
+                : undefined);
+            const mezzVal = mezzRows.reduce((acc, mr) => acc + (mr.rValuesByYear?.[y] ?? 0), 0);
+            if (eqVal !== undefined && aVal - mezzVal - eqVal > 0) {
+              liabRow.rValuesByYear[y] = aVal - mezzVal - eqVal;
             }
           }
         }
@@ -4497,8 +5215,10 @@ export async function POST(request) {
 
     for (const key of ['IS', 'BS', 'CF']) {
       const mergedRows = [];
+      let currentCfSection = 0;
 
       for (const item of rawSheets[key]) {
+        const itemCfSection = key === 'CF' ? currentCfSection : 0;
         const isBold =
           item.isNonTotalOperatingExpense || (item.dimMember && !item.isTotalRow)
             ? false
@@ -4509,6 +5229,7 @@ export async function POST(request) {
             r.korName === item.korName &&
             r.rowType === item.rowType &&
             (r.dimMember || '') === (item.dimMember || '') &&
+            (key !== 'CF' || r.cfSection === itemCfSection) &&
             r.values.some((v, i) => v === null && item.values[i] !== null) &&
             !r.values.some(
               (v, i) => v !== null && item.values[i] !== null && Math.abs(v - item.values[i]) > 5
@@ -4521,21 +5242,32 @@ export async function POST(request) {
           );
           existingRow.bold = existingRow.bold || isBold;
         } else {
-          const sig = `${item.rowType}_${item.dimMember || ''}_${item.korName}_${item.values.join(',')}`;
+          const sig = `${item.rowType}_${item.dimMember || ''}_${itemCfSection}_${item.korName}_${item.values.join(',')}`;
           if (
             !mergedRows.some(
-              (r) => `${r.rowType}_${r.dimMember || ''}_${r.korName}_${r.values.join(',')}` === sig
+              (r) =>
+                `${r.rowType}_${r.dimMember || ''}_${r.cfSection ?? 0}_${r.korName}_${r.values.join(',')}` === sig
             )
           ) {
             mergedRows.push({
               rowType: item.rowType,
               dimMember: item.dimMember || '',
+              cfSection: itemCfSection,
               korName: item.korName,
               isEps: item.isEps,
               bold: isBold,
               values: [...item.values],
             });
           }
+        }
+
+        if (
+          key === 'CF' &&
+          !item.dimMember &&
+          item.isTotalRow &&
+          /(?:Operating|Investing|Financing)Activities/i.test(item.tag || '')
+        ) {
+          currentCfSection++;
         }
       }
 
