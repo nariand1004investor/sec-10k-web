@@ -192,6 +192,8 @@ const STANDARD_KOR_DICT = {
   RevenueFromContractWithCustomerIncludingAssessedTax: { kor: '매출액', sign: 'raw', bold: true },
   Revenues: { kor: '매출액', sign: 'raw', bold: true },
   SalesRevenueNet: { kor: '매출액', sign: 'raw', bold: true },
+  RegulatedAndUnregulatedOperatingRevenue: { kor: '영업수익', sign: 'raw', bold: true },
+  RegulatedOperatingRevenue: { kor: '영업수익', sign: 'raw', bold: true },
   SalesRevenueGoodsNet: { kor: '상품매출액', sign: 'raw' },
   SalesRevenueServicesNet: { kor: '용역매출액', sign: 'raw' },
   CostOfGoodsAndServicesSold: { kor: '매출원가', sign: 'pos' },
@@ -206,8 +208,8 @@ const STANDARD_KOR_DICT = {
   DepreciationAndAmortization: { kor: '감가상각비및무형자산상각비', sign: 'pos' },
   Depreciation: { kor: '감가상각비', sign: 'pos' },
   AmortizationOfIntangibleAssets: { kor: '무형자산상각비', sign: 'pos' },
-  RestructuringCharges: { kor: '매장폐쇄및기타비용(순액)', sign: 'raw' },
-  RestructuringSettlementAndImpairmentProvisions: { kor: '매장폐쇄및기타비용(순액)', sign: 'raw' },
+  RestructuringCharges: { kor: '구조조정및기타비용(순액)', sign: 'raw' },
+  RestructuringSettlementAndImpairmentProvisions: { kor: '구조조정및기타비용(순액)', sign: 'raw' },
   AssetImpairmentCharges: { kor: '자산손상차손', sign: 'raw' },
   OperatingExpenses: { kor: '영업비용합계', sign: 'pos', bold: true },
   CostsAndExpenses: { kor: '총원가및영업비용', sign: 'pos', bold: true },
@@ -365,6 +367,9 @@ const STANDARD_KOR_DICT = {
   LongTermDebtNoncurrent: { kor: '장기차입금및금융리스부채', sign: 'raw' },
   LongTermDebt: { kor: '장기차입금및금융리스부채', sign: 'raw' },
   LongTermDebtAndCapitalLeaseObligations: { kor: '장기차입금및금융리스부채', sign: 'raw' },
+  CapitalizationLongtermDebtAndEquity: { kor: '총자본화금액', sign: 'raw' },
+  AssetRetirementObligationsNoncurrent: { kor: '자산복구충당부채', sign: 'raw' },
+  AssetRetirementObligation: { kor: '자산복구충당부채', sign: 'raw' },
   OperatingLeaseLiabilityNoncurrent: { kor: '장기영업리스부채', sign: 'raw' },
   FinanceLeaseLiabilityNoncurrent: { kor: '비유동금융리스부채', sign: 'raw' },
   CapitalLeaseObligationsNoncurrent: { kor: '비유동금융리스부채', sign: 'raw' },
@@ -830,6 +835,9 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
   if (stmtType === 'BS' && tag === 'LiabilitiesAndStockholdersEquity') {
     return '[[부채와자본총계]]';
   }
+  if (tag === 'ProfitLoss') {
+    return '연결당기순이익';
+  }
 
   const raw = stripDynamicParentheticals(contextualLabel);
   if (!raw) return null;
@@ -844,6 +852,21 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
   }
 
   if (!/[a-zA-Z]/.test(raw)) return raw;
+
+  if (
+    stmtType === 'CF' &&
+    /IncreaseDecreaseIn(?:Accounts)?Receivables?/i.test(tag) &&
+    /^(?:trade\s+)?(?:accounts\s+)?receivables?$/i.test(raw)
+  ) {
+    return '매출채권의 증감';
+  }
+  if (
+    stmtType === 'CF' &&
+    tag === 'PaymentsToMinorityShareholders' &&
+    /\b(?:distributions?|dividends?)\b/i.test(raw)
+  ) {
+    return /\bdividends?\b/i.test(raw) ? '비지배지분 배당금의 지급' : '비지배지분 분배금 지급';
+  }
 
   const exactRules = [
     [/^interest and fees on loans and leases$/i, '대출채권및리스이자수익'],
@@ -908,7 +931,7 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
     [/^cash and cash equivalents,?\s*end of (?:period|year)$/i, '기말 현금및현금성자산'],
     [/^cash and cash equivalents$/i, '현금및현금성자산'],
     [/^restricted cash$/i, '사용제한현금'],
-    [/^marketable securities$/i, '단기유가증권'],
+    [/^marketable securities$/i, /Noncurrent/i.test(tag) ? '장기유가증권' : '단기유가증권'],
     [/^(?:cash )?performance bonds and (?:guaranty|guarantee) fund contributions$/i,
       '계약이행보증금및보증기금'],
     [/^time deposits placed and other short-?term investments$/i,
@@ -977,8 +1000,14 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
       '장기차입금및금융리스부채'],
     [/^other non-?current liabilities$|^other long-?term liabilities$|^other liabilities$/i,
       stmtType === 'CF' ? '기타부채의 증감' : '기타비유동부채'],
+    [/^deferred income tax assets?,?\s*net$|^deferred income tax assets?$|^deferred tax assets?,?\s*net$|^deferred tax assets?$/i,
+      stmtType === 'BS' ? '이연법인세자산' : '이연법인세비용(혜택)'],
     [/^deferred income tax liabilities,?\s*net$|^deferred income tax liabilities$|^deferred income taxes$/i,
-      stmtType === 'BS' ? '이연법인세부채' : '이연법인세비용(혜택)'],
+      stmtType === 'BS'
+        ? /Deferred(?:Income)?TaxAssets/i.test(tag)
+          ? '이연법인세자산'
+          : '이연법인세부채'
+        : '이연법인세비용(혜택)'],
     [/^common stock$/i, '보통주자본금'],
     [/^preferred stock$/i, '우선주자본금'],
     [/^additional paid-?in capital$/i, '자본잉여금(보통주)'],
@@ -1047,8 +1076,8 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
     [/^common stock repurchased$|^repurchases of common stock$|^treasury stock purchases?$|^purchases? of treasury stock$/i,
       '자기주식의 취득(자사주매입)'],
     [/^cash dividends paid$|^dividends paid$|^dividends paid on common stock$/i, '현금배당금의 지급'],
-    [/^dividends paid to noncontrolling interests?$|^distributions to noncontrolling interests?$/i,
-      '비지배지분 배당금의 지급'],
+    [/^dividends paid to noncontrolling interests?(?:\s+holders)?$/i, '비지배지분 배당금의 지급'],
+    [/^distributions to noncontrolling interests?(?:\s+holders)?$/i, '비지배지분 분배금 지급'],
     [/^other financing activities,?\s*net$/i, '기타재무활동현금흐름(순)'],
 
     [/^revenues?$|^net sales$|^total net sales$|^total revenues?$/i, '매출액'],
@@ -1062,11 +1091,36 @@ function matchExactKoreanAccountName(contextualLabel, tag = '', stmtType = '', r
     [/^selling,?\s*general and administrative.*$/i, '판매비와관리비'],
     [/^total operating expenses$|^operating expenses$/i, '영업비용합계'],
     [/^operating income$|^operating income \(loss\)$|^operating profit$/i, '영업이익'],
-    [/^other income \(loss\)$|^other income,?\s*net$|^other income \(expense\),?\s*net$|^other,?\s*net$/i,
-      '기타손익(순)'],
+    [/^other income \(loss\)$|^other income,?\s*net$|^other income \(expense\),?\s*net$/i, '기타손익(순)'],
+    [/^other,?\s*net$/i,
+      stmtType === 'CF'
+        ? /Investing/i.test(tag)
+          ? '기타투자활동현금흐름(순)'
+          : /Financing/i.test(tag)
+          ? '기타재무활동현금흐름(순)'
+          : /Noncash/i.test(tag)
+          ? '기타비현금성손익'
+          : /Operating/i.test(tag)
+          ? '기타영업활동현금흐름(순)'
+          : null
+        : '기타손익(순)'],
     [/^income before income taxes$|^income \(loss\) before income taxes$|^income before provision for income taxes$|^earnings before income taxes$/i,
       '법인세비용차감전순이익'],
-    [/^provision for income taxes$|^income tax provision$|^income tax expense$|^income taxes$/i, '법인세비용'],
+    [/^provision for income taxes$|^income tax provision$|^income tax expense$/i, '법인세비용'],
+    [/^income taxes$/i,
+      stmtType === 'BS'
+        ? /Noncurrent/i.test(tag)
+          ? '장기미지급법인세'
+          : /Receivable|Asset/i.test(tag)
+          ? '미수법인세'
+          : '미지급법인세(유동)'
+        : stmtType === 'CF'
+        ? /IncomeTaxesPaid/i.test(tag)
+          ? '법인세납부액'
+          : /Deferred/i.test(tag)
+          ? '이연법인세비용(혜택)'
+          : '미지급법인세의 증감'
+        : '법인세비용'],
     [/^net income$|^net earnings$|^net income \(loss\)$/i, '당기순이익'],
     [/^net increase \(decrease\) in cash and cash equivalents.*$/i, '현금및현금성자산의 순증감'],
     [/^effect of exchange rate changes on cash.*/i, '현금에 대한 환율변동효과'],
@@ -4106,24 +4160,32 @@ function translateDimensionalRowKorName(item, stmtType) {
     }
   }
 
-  const segKor = SEGMENT_PREFIX_KOR_MAP[dim] || dim.replace(/^SEG_/, '').replace(/_/g, ' ');
+  const mappedSegKor = SEGMENT_PREFIX_KOR_MAP[dim] || null;
+  let baseKor = null;
+  let isTotalLabel = false;
 
   // 부문 소계 행
   if (item.isTotalRow) {
     if (stmtType === 'IS') {
-      if (tag === 'Revenues' || /revenues?$/i.test(raw)) return `[${segKor} 매출액 합계]`;
-      if (tag === 'CostsAndExpenses' || /costs? and expenses?$/i.test(raw)) {
-        return `[${segKor} 원가및영업비용 합계]`;
+      if (tag === 'Revenues' || /revenues?$/i.test(raw)) {
+        baseKor = '매출액 합계';
+        isTotalLabel = true;
+      } else if (tag === 'CostsAndExpenses' || /costs? and expenses?$/i.test(raw)) {
+        baseKor = '원가및영업비용 합계';
+        isTotalLabel = true;
       }
     }
     if (stmtType === 'BS') {
-      if (tag === 'Assets' || /assets$/i.test(raw)) return `[${segKor} 자산 합계]`;
-      if (
+      if (tag === 'Assets' || /assets$/i.test(raw)) {
+        baseKor = '자산 합계';
+        isTotalLabel = true;
+      } else if (
         tag === 'Liabilities' ||
         tag === 'LiabilitiesExcludingIncomeTaxesPrincipallyDeferred' ||
         /liabilities/i.test(raw)
       ) {
-        return `[${segKor} 부채 합계]`;
+        baseKor = '부채 합계';
+        isTotalLabel = true;
       }
     }
   }
@@ -4195,32 +4257,43 @@ function translateDimensionalRowKorName(item, stmtType) {
     RepaymentsOfLongTermDebt: '장기차입금의 상환',
   };
 
-  let baseKor = segTagMap[tag] || null;
   if (!baseKor) {
-    if (tag === 'PremiumsAndOtherReceivablesNet' || tag === 'AccountsAndOtherReceivablesNet') {
-      baseKor = /^other receivables$/i.test(raw) ? '기타수취채권' : '수취채권';
-    } else if (tag === 'SalesRevenueNet' || tag === 'RevenueFromContractWithCustomerExcludingAssessedTax') {
-      baseKor = '판매및서비스매출액';
-    } else if (tag === 'GainLossOnInvestments') {
-      baseKor = '투자손익';
-    } else if (tag === 'GainLossOnDerivativeInstrumentsNetPretax') {
-      baseKor = '파생상품 계약 손익';
+    baseKor = segTagMap[tag] || null;
+    if (!baseKor) {
+      if (tag === 'PremiumsAndOtherReceivablesNet' || tag === 'AccountsAndOtherReceivablesNet') {
+        baseKor = /^other receivables$/i.test(raw) ? '기타수취채권' : '수취채권';
+      } else if (tag === 'SalesRevenueNet' || tag === 'RevenueFromContractWithCustomerExcludingAssessedTax') {
+        baseKor = '판매및서비스매출액';
+      } else if (tag === 'GainLossOnInvestments') {
+        baseKor = '투자손익';
+      } else if (tag === 'GainLossOnDerivativeInstrumentsNetPretax') {
+        baseKor = '파생상품 계약 손익';
+      }
+    }
+
+    if (!baseKor) {
+      baseKor =
+        matchExactKoreanAccountName(raw, tag, stmtType, item.rowType) ||
+        translateSpecialAndInsuranceLabels(raw, tag, stmtType) ||
+        STANDARD_KOR_DICT[tag]?.kor ||
+        null;
     }
   }
 
-  if (!baseKor) {
-    baseKor =
-      matchExactKoreanAccountName(raw, tag, stmtType, item.rowType) ||
-      translateSpecialAndInsuranceLabels(raw, tag, stmtType) ||
-      STANDARD_KOR_DICT[tag]?.kor ||
-      null;
+  const validBaseKor = baseKor && !/[a-zA-Z]{3,}/.test(baseKor) ? baseKor : null;
+
+  if (mappedSegKor) {
+    if (validBaseKor) {
+      return isTotalLabel ? `[${mappedSegKor} ${validBaseKor}]` : `[${mappedSegKor}] ${validBaseKor}`;
+    }
+    return null;
   }
 
-  if (baseKor && !/[a-zA-Z]{3,}/.test(baseKor)) {
-    return `[${segKor}] ${baseKor}`;
-  }
-
-  return null;
+  return {
+    pendingSegDim: dim,
+    baseKor: validBaseKor,
+    isTotalLabel,
+  };
 }
 
 const PRESERVED_SHORT_ACRONYMS = new Set([
@@ -4285,6 +4358,19 @@ function sanitizeAiKoreanLabel(aiKor) {
   if (finalCheck.some((tok) => !PRESERVED_SHORT_ACRONYMS.has(tok.toUpperCase()))) {
     return null;
   }
+
+  // K-IFRS 표준 용어 보정 및 AI 흔한 오타·단어 중복 결정적 정규화
+  s = s
+    .replace(/사업결정/g, '사업결합')
+    .replace(/제한용현금성자산/g, '사용제한현금성자산')
+    .replace(/제한용현금|제한용예금|제한예금/g, '사용제한현금')
+    .replace(/차무상환/g, '채무상환')
+    .replace(/받어음/g, '받을어음')
+    .replace(/처분처분/g, '처분')
+    .replace(/조건부대가는부(?:채)?/g, '조건부대가부채')
+    .replace(/미지급비용\s*(?:및|과|와)\s*미지급비용/g, '매입채무 및 미지급비용')
+    .replace(/운영리스/g, '영업리스');
+
   return s;
 }
 
@@ -4298,6 +4384,12 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
   const phraseDict = [
     ['mortgage servicing rights', '모기지관리권자산'],
     ['servicing rights', '관리권자산'],
+    ['business combination', '사업결합'],
+    ['asset retirement', '자산복구충당부채'],
+    ['senior notes', '선순위사채'],
+    ['financial products', '금융상품'],
+    ['financial services', '금융서비스'],
+    ['restricted cash', '사용제한현금'],
     ['contingent consideration', '조건부대가'],
     ['rental equipment', '렌탈장비'],
     ['deferred gain', '이연이익'],
@@ -4361,6 +4453,16 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
     ['impairment', '손상차손'],
     ['operating expenses', '영업비용'],
     ['corporate expenses', '법인관리비'],
+    ['capitalization', '총자본화금액'],
+    ['machinery', '기계장비'],
+    ['transportation', '운송'],
+    ['industrial', '산업'],
+    ['healthcare', '헬스케어'],
+    ['equipment', '장비'],
+    ['energy', '에너지'],
+    ['power', '전력'],
+    ['products', '제품'],
+    ['services', '서비스'],
     ['cash', '현금'],
   ];
 
@@ -4374,6 +4476,9 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
   }
 
   if (matched.length > 0) {
+    if (stmtType === 'SEGMENT') {
+      return matched.slice(0, 3).join('·');
+    }
     let base = matched.slice(0, 2).join('및');
     if (/^total\s+/i.test(lower)) return `${base}합계`;
     if (stmtType === 'CF') {
@@ -4385,6 +4490,7 @@ function fallbackKoreanLabelBuilder(engLabel, tag = '', stmtType = '') {
     return base;
   }
 
+  if (stmtType === 'SEGMENT') return '기타사업부문';
   return src;
 }
 
@@ -4406,11 +4512,15 @@ async function translateGeminiChunk(batchItems, modelCandidates, deadModels, api
   });
 
   const prompt = `당신은 미국 SEC 10-K 재무제표 전문 한국어 공인회계사입니다.
-아래 JSON 객체의 영문 재무제표 계정명(label, tag)들을 한국 실무 회계 기준(K-IFRS / 금융·보험·리츠·제조·유통 회계기준)에 맞는 정확하고 자연스러운 **순수 한글 계정명**으로 번역하세요.
-- 숫자 Key("0", "1"...)를 하나도 빠짐없이 그대로 유지하여 JSON 객체로만 응답하세요.
-- 괄호 안에 영문 원어나 영문 약어(예: MSRs, ATM, NIM 등)를 병기하지 말고 순수 한글 계정명만 출력하세요.
-- 달러($) 표기나 (in dollars) 같은 불필요한 괄호는 제거하세요.
-- 합계(Total)가 아닌 개별 영업비용(예: Insurance operating expenses)은 절대 '영업비용합계'로 번역하지 말고 '보험영업비용'처럼 구체적으로 번역하세요.
+아래 JSON 객체의 영문 재무제표 계정명(stmt, label, tag)들을 K-IFRS 한국 실무 회계 기준에 맞는 정확하고 자연스러운 **순수 한글 계정명**으로 번역하세요.
+- 숫자 Key("0", "1"...)를 빠짐없이 그대로 유지하여 JSON 객체로만 응답하세요.
+- 괄호 안에 영문 원어나 약어(MSRs, ATM 등)를 병기하지 말고, 달러($)·(in dollars) 표기도 제거하세요.
+- 합계(Total)가 아닌 개별 영업비용은 절대 '영업비용합계'로 번역하지 말고 구체적으로 번역하세요.
+- K-IFRS 표준 용어 준수: Senior notes→선순위사채, 부채성 Provisions/Accruals/Reserves→충당부채, Business combination→사업결합, Debt extinguishment→채무상환, Restricted cash→사용제한현금.
+- 현금흐름표(stmt: "CF")의 운전자본 변동(tag에 IncreaseDecrease/NetChange 포함 또는 자산·부채 항목)은 반드시 '~의 증감'으로 표기하세요.
+- label이 사업부문명 단독(예: "Financial Products")이면 tag의 회계 성격(단기차입금·장기차입금·차입·상환 등)을 함께 반영해 구분하세요.
+- stmt가 "SEGMENT"인 항목은 사업부문 접두사(예: "기계·에너지·운송", "금융상품")로 간결한 한글 명사구만 출력하세요.
+- 오타나 단어 중복 없이 자연스러운 한국어 회계 용어로만 출력하세요.
 
 응답 예시:
 {"0": "시장조성및유사활동수익", "1": "매도가능채무증권의 취득"}
@@ -5077,6 +5187,8 @@ export async function POST(request) {
     // 5. ★ 수치 확정 이후 한글 계정명(korName) 결정 단계 (수치 데이터는 이미 위 4단계에서 100% 확정됨!)
     // =========================================================================================
     const needsAiList = [];
+    const segNeedsAiMap = new Map();
+    const pendingSegOnlyItems = [];
 
     for (const key of ['IS', 'BS', 'CF']) {
       const hasMultiSegInSheet = rawSheets[key].some(
@@ -5088,19 +5200,90 @@ export async function POST(request) {
         key === 'CF' && rawSheets.CF.some((r) => r.tag === 'NetCashProvidedByUsedInInvestingActivities');
       const hasFinTotal =
         key === 'CF' && rawSheets.CF.some((r) => r.tag === 'NetCashProvidedByUsedInFinancingActivities');
+      const hasTotalOrDiscEps =
+        key === 'IS' &&
+        rawSheets.IS.some(
+          (r) =>
+            r.rowType === 'EPS' &&
+            !r.dimMember &&
+            (r.tag === 'EarningsPerShareBasic' ||
+              r.tag === 'EarningsPerShareDiluted' ||
+              /DiscontinuedOperation/i.test(r.tag || '') ||
+              /\bdiscontinued\b/i.test(stripDynamicParentheticals(r.contextualLabel || '')))
+        );
       for (const item of rawSheets[key]) {
         // (0) 다차원(dimMember) 전용 정밀 한글 변환 (부문 접두사 + Class A/B 구분)
         if (item.dimMember) {
-          const dimKor = translateDimensionalRowKorName(item, key);
-          if (dimKor) {
-            item.korName = dimKor;
+          const dimRes = translateDimensionalRowKorName(item, key);
+          if (typeof dimRes === 'string') {
+            item.korName = dimRes;
+          } else if (dimRes && typeof dimRes === 'object' && dimRes.pendingSegDim) {
+            const rawSegEng = dimRes.pendingSegDim
+              .replace(/^SEG_/, '')
+              .replace(/_/g, ' ')
+              .toLowerCase()
+              .replace(/\b\w/g, (c) => c.toUpperCase());
+            const segKey = `__SEG__${dimRes.pendingSegDim}`;
+            if (!segNeedsAiMap.has(segKey)) {
+              segNeedsAiMap.set(segKey, {
+                rowKey: segKey,
+                stmtType: 'SEGMENT',
+                contextualLabel: rawSegEng,
+                tag: dimRes.pendingSegDim,
+                rawSegEng,
+              });
+            }
+            item.pendingSegKey = segKey;
+            item.isSegTotalLabel = Boolean(dimRes.isTotalLabel);
+            if (dimRes.baseKor) {
+              item.resolvedBaseKor = dimRes.baseKor;
+              pendingSegOnlyItems.push(item);
+            } else {
+              needsAiList.push(item);
+            }
           } else {
-            item.pendingSegPrefix =
-              SEGMENT_PREFIX_KOR_MAP[item.dimMember] ||
-              item.dimMember.replace(/^SEG_/, '').replace(/_/g, ' ');
+            item.pendingSegPrefix = SEGMENT_PREFIX_KOR_MAP[item.dimMember];
             needsAiList.push(item);
           }
           continue;
+        }
+
+        // (0b) 계속영업·중단영업 EPS 라벨 분리 (Step 5 Presentation Layer 전용 — Pass 4 불변 보장)
+        if (key === 'IS' && item.rowType === 'EPS') {
+          const rawLbl = stripDynamicParentheticals(item.contextualLabel || '');
+          const epsTag = String(item.tag || '');
+          if (!/comprehensive/i.test(`${rawLbl} ${epsTag}`)) {
+            const isDiscontinued =
+              /DiscontinuedOperation/i.test(epsTag) || /\bdiscontinued\b/i.test(rawLbl);
+            const isContinuing =
+              !isDiscontinued &&
+              ((hasTotalOrDiscEps && /IncomeLossFromContinuingOperationsPer/i.test(epsTag)) ||
+                /\bcontinuing\b/i.test(rawLbl));
+            const isDiluted = /diluted/i.test(rawLbl) || /Diluted/i.test(epsTag);
+            const isBasic =
+              (!isDiluted && (/basic/i.test(rawLbl) || /Basic/i.test(epsTag))) ||
+              (/basic/i.test(rawLbl) && !/diluted/i.test(rawLbl));
+            if (isDiscontinued) {
+              if (isBasic) {
+                item.korName = '중단영업 기본 주당순이익(달러)';
+                continue;
+              }
+              if (isDiluted) {
+                item.korName = '중단영업 희석 주당순이익(달러)';
+                continue;
+              }
+            }
+            if (isContinuing) {
+              if (isBasic) {
+                item.korName = '계속영업 기본 주당순이익(달러)';
+                continue;
+              }
+              if (isDiluted) {
+                item.korName = '계속영업 희석 주당순이익(달러)';
+                continue;
+              }
+            }
+          }
         }
 
         // 다차원 복합 지주사 비차원 특수 라벨 보정 (5개 기준 종목에는 해당 문구 미존재)
@@ -5192,8 +5375,15 @@ export async function POST(request) {
       }
     }
 
-    if (needsAiList.length > 0) {
-      const aiMap = await alignAndTranslateWithGemini(needsAiList, rawSheets, apiKey.trim());
+    if (needsAiList.length > 0 || segNeedsAiMap.size > 0) {
+      const allAiItems = [...needsAiList, ...segNeedsAiMap.values()];
+      const aiMap = await alignAndTranslateWithGemini(allAiItems, rawSheets, apiKey.trim());
+      const segKorMap = {};
+      for (const [segKey, segItem] of segNeedsAiMap.entries()) {
+        const aiSeg = sanitizeAiKoreanLabel(aiMap[segKey]);
+        segKorMap[segKey] =
+          aiSeg || fallbackKoreanLabelBuilder(segItem.rawSegEng, segItem.tag, 'SEGMENT');
+      }
       for (const item of needsAiList) {
         const aiKor = sanitizeAiKoreanLabel(aiMap[item.rowKey]);
         let baseKor;
@@ -5206,7 +5396,91 @@ export async function POST(request) {
             item.stmtType
           );
         }
-        item.korName = item.pendingSegPrefix ? `[${item.pendingSegPrefix}] ${baseKor}` : baseKor;
+        const segPrefix = item.pendingSegKey ? segKorMap[item.pendingSegKey] : item.pendingSegPrefix;
+        item.korName = segPrefix
+          ? item.isSegTotalLabel
+            ? `[${segPrefix} ${baseKor}]`
+            : `[${segPrefix}] ${baseKor}`
+          : baseKor;
+      }
+      for (const item of pendingSegOnlyItems) {
+        const segPrefix = segKorMap[item.pendingSegKey] || '기타사업부문';
+        item.korName = item.isSegTotalLabel
+          ? `[${segPrefix} ${item.resolvedBaseKor}]`
+          : `[${segPrefix}] ${item.resolvedBaseKor}`;
+      }
+    }
+
+    // (3) Step 5 번역 완료 후 시트 문맥 기반 동일 라벨 세분화 (수치·행 구조 불변, A열 표시 텍스트만 보정)
+    {
+      let cfSec = 0;
+      for (const item of rawSheets.CF) {
+        if (!item.dimMember) {
+          const rawLbl = stripDynamicParentheticals(item.contextualLabel || '');
+          if (
+            /^other(?:[\s,\-—–]+net)?$/i.test(rawLbl) &&
+            (item.korName === '기타손익(순)' || item.korName === '기타')
+          ) {
+            item.korName =
+              cfSec === 0
+                ? '기타영업활동현금흐름(순)'
+                : cfSec === 1
+                ? '기타투자활동현금흐름(순)'
+                : '기타재무활동현금흐름(순)';
+          }
+        }
+        if (
+          !item.dimMember &&
+          item.isTotalRow &&
+          /(?:Operating|Investing|Financing)Activities/i.test(item.tag || '')
+        ) {
+          cfSec++;
+        }
+      }
+    }
+
+    if (rawSheets.BS.length > 0) {
+      const bsGroups = new Map();
+      const hasCaTotal = rawSheets.BS.some((r) => !r.dimMember && r.korName === '[유동자산 합계]');
+      const hasClTotal = rawSheets.BS.some((r) => !r.dimMember && r.korName === '[유동부채 합계]');
+      const assetsIdx = rawSheets.BS.findIndex((r) => !r.dimMember && r.korName === '[[자산총계]]');
+      const caIdx = rawSheets.BS.findIndex((r) => !r.dimMember && r.korName === '[유동자산 합계]');
+      const clIdx = rawSheets.BS.findIndex((r) => !r.dimMember && r.korName === '[유동부채 합계]');
+      const liabIdx = rawSheets.BS.findIndex((r) => !r.dimMember && r.korName === '[[부채총계]]');
+
+      rawSheets.BS.forEach((item, idx) => {
+        if (item.dimMember || item.isTotalRow || !item.korName) return;
+        const tag = String(item.tag || '');
+        const isTagCurr = /Current$/i.test(tag) && !/Noncurrent$|CurrentAndNoncurrent$/i.test(tag);
+        const isTagNoncurr = /Noncurrent$/i.test(tag) && !/CurrentAndNoncurrent$/i.test(tag);
+        const inCurrSec =
+          (hasCaTotal && caIdx !== -1 && idx < caIdx) ||
+          (hasClTotal && clIdx !== -1 && (assetsIdx === -1 || idx > assetsIdx) && idx < clIdx);
+        const inNoncurrSec =
+          (hasCaTotal && caIdx !== -1 && idx > caIdx && (assetsIdx === -1 || idx < assetsIdx)) ||
+          (hasClTotal && clIdx !== -1 && idx > clIdx && (liabIdx === -1 || idx < liabIdx));
+        if (!bsGroups.has(item.korName)) bsGroups.set(item.korName, []);
+        bsGroups.get(item.korName).push({
+          item,
+          isCurr: isTagCurr || (!isTagNoncurr && inCurrSec),
+          isNoncurr: isTagNoncurr || (!isTagCurr && inNoncurrSec),
+        });
+      });
+
+      for (const entries of bsGroups.values()) {
+        if (entries.length < 2) continue;
+        const hasCurr = entries.some((e) => e.isCurr && !e.isNoncurr);
+        const hasNoncurr = entries.some((e) => e.isNoncurr && !e.isCurr);
+        if (!hasCurr || !hasNoncurr) continue;
+        for (const { item, isCurr, isNoncurr } of entries) {
+          if (isCurr && !isNoncurr && !/유동|단기/.test(item.korName)) {
+            item.korName = `${item.korName}(유동)`;
+          } else if (isNoncurr && !isCurr && !/비유동|장기/.test(item.korName)) {
+            item.korName = /^단기/.test(item.korName)
+              ? item.korName.replace(/^단기/, '장기')
+              : `${item.korName}(비유동)`;
+          }
+        }
       }
     }
 
