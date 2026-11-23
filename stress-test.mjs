@@ -684,12 +684,14 @@ function auditBalanceSheetIdentity(ticker, sheets) {
   };
 }
 
-// [검증 2] 주요 소계 합산 일치: 유동자산, 유동부채, 영업CF, 투자CF, 재무CF
+// [검증 2] 주요 소계 합산 일치: 유동자산, 비유동자산, 유동부채, 비유동부채, 영업CF, 투자CF, 재무CF
 function auditMajorSubtotals(ticker, sheets) {
   const failures = [];
   const breakdown = {
     유동자산: 'FAIL',
+    비유동자산: 'N/A',
     유동부채: 'FAIL',
+    비유동부채: 'N/A',
     영업현금흐름: 'FAIL',
     투자현금흐름: 'FAIL',
     재무현금흐름: 'FAIL',
@@ -828,7 +830,9 @@ function auditMajorSubtotals(ticker, sheets) {
 
     if (hasAssetsRow && !hasAnyClassifiedSubtotal) {
       breakdown['유동자산'] = 'N/A(미구분BS)';
+      breakdown['비유동자산'] = 'N/A(미구분BS)';
       breakdown['유동부채'] = 'N/A(미구분BS)';
+      breakdown['비유동부채'] = 'N/A(미구분BS)';
     } else {
       const caIdx = findIdx(
         bsRows,
@@ -929,6 +933,89 @@ function auditMajorSubtotals(ticker, sheets) {
           componentRows: clCompRows,
           keyName: '유동부채',
         });
+      }
+
+      const ncaIdx = findIdx(
+        bsRows,
+        '[비유동자산 합계]',
+        /비유동자산\s*합계|^total (?:non-?current|other) assets$/i
+      );
+      if (ncaIdx !== -1 && caIdx !== -1 && ncaIdx > caIdx) {
+        let ncaStart = caIdx + 1;
+        const assetsIdx = bsRows.findIndex(
+          (r) =>
+            r.label === '[[자산총계]]' ||
+            (/^\[*자산총계\]*$|^총자산$/i.test(r.label) && !/부채/.test(r.label))
+        );
+        if (assetsIdx !== -1 && ncaIdx < assetsIdx) {
+          let directOk = 0;
+          let directFail = 0;
+          for (let yi = 0; yi < bsYears.length; yi++) {
+            const caV = bsRows[caIdx].values[yi];
+            const ncaV = bsRows[ncaIdx].values[yi];
+            const aV = bsRows[assetsIdx].values[yi];
+            if (caV === null || ncaV === null || aV === null) continue;
+            if (Math.abs(caV + ncaV - aV) <= 3) directOk++;
+            else directFail++;
+          }
+          if (directFail > 0 && directOk === 0) {
+            for (let k = 1; k <= 3 && caIdx + 1 + k < ncaIdx; k++) {
+              const lead = bsRows.slice(caIdx + 1, caIdx + 1 + k);
+              if (lead.some((r) => /^\[.*합계\]$/.test(r.label))) break;
+              let kOk = 0;
+              let kFail = 0;
+              for (let yi = 0; yi < bsYears.length; yi++) {
+                const caV = bsRows[caIdx].values[yi];
+                const ncaV = bsRows[ncaIdx].values[yi];
+                const aV = bsRows[assetsIdx].values[yi];
+                if (caV === null || ncaV === null || aV === null) continue;
+                const leadSum = lead.reduce((acc, lr) => acc + (lr.values[yi] ?? 0), 0);
+                if (Math.abs(caV + leadSum + ncaV - aV) <= 3) kOk++;
+                else kFail++;
+              }
+              if (kOk > 0 && kFail === 0) {
+                ncaStart = caIdx + 1 + k;
+                break;
+              }
+            }
+          }
+        }
+        const ncaCompRows = bsRows
+          .slice(ncaStart, ncaIdx)
+          .filter((r) => !/^\[.*합계\]$/.test(r.label));
+        evaluateSubtotal({
+          sheetName: '재무상태표',
+          rows: bsRows,
+          years: bsYears,
+          subtotalIdx: ncaIdx,
+          componentRows: ncaCompRows,
+          keyName: '비유동자산',
+        });
+      }
+
+      const nclIdx = findIdx(
+        bsRows,
+        '[비유동부채 합계]',
+        /비유동부채\s*합계|^total (?:non-?current|long-?term) liabilities$/i
+      );
+      if (nclIdx !== -1 && clIdx !== -1 && nclIdx > clIdx) {
+        const nclCompRows = bsRows
+          .slice(clIdx + 1, nclIdx)
+          .filter(
+            (r) =>
+              !/^\[.*\]$/.test(r.label) &&
+              !/상환가능|메자닌|redeemable|temporary\s+equity/i.test(r.label)
+          );
+        if (nclCompRows.length > 0) {
+          evaluateSubtotal({
+            sheetName: '재무상태표',
+            rows: bsRows,
+            years: bsYears,
+            subtotalIdx: nclIdx,
+            componentRows: nclCompRows,
+            keyName: '비유동부채',
+          });
+        }
       }
     }
   }
@@ -1826,6 +1913,7 @@ function getSecAnnualFactValueForTag(factsObj, tag, targetYear, isInstant, fyeMo
     valRaw: latest.val,
     valM: latest.val / 1e6,
     allValuesM: matches.map((m) => m.val / 1e6),
+    allRecords: matches.map((m) => ({ valM: m.val / 1e6, filed: m.filed || '' })),
     end: latest.end,
     start: latest.start || null,
     filed: latest.filed || '',
@@ -1843,13 +1931,33 @@ function getSecAnnualFactBest(factsObj, tagCandidates, targetYear, isInstant, fy
 
   const primary = foundList[0];
   if (preferMaxOverride && foundList.length > 1) {
+    const revTagSet = new Set([
+      'Revenues',
+      'RegulatedAndUnregulatedOperatingRevenue',
+      'RevenueFromContractWithCustomerExcludingAssessedTax',
+      'RevenueFromContractWithCustomerIncludingAssessedTax',
+      'SalesRevenueNet',
+    ]);
+    const revItems = foundList.filter((c) => revTagSet.has(c.tag));
+    if (revItems.length > 1 && primary.filed) {
+      const primaryMs = new Date(primary.filed).getTime();
+      const newerRestated = revItems
+        .filter((c) => {
+          if (!c.filed || Math.abs(c.valM) <= 0 || Math.abs(primary.valM) <= 0) return false;
+          const diffDays = (new Date(c.filed).getTime() - primaryMs) / 86400000;
+          const ratio = Math.abs(c.valM) / Math.abs(primary.valM);
+          return diffDays >= 180 && ratio >= 0.5 && ratio <= 2.0;
+        })
+        .sort((a, b) => (b.filed || '').localeCompare(a.filed || ''));
+      if (newerRestated.length > 0) {
+        return newerRestated[0];
+      }
+    }
     const maxItem = foundList.reduce((best, cur) =>
       Math.abs(cur.valM) > Math.abs(best.valM) ? cur : best
     );
     if (
-      ['Revenues', 'RegulatedAndUnregulatedOperatingRevenue', 'RevenueFromContractWithCustomerExcludingAssessedTax', 'SalesRevenueNet'].includes(
-        maxItem.tag
-      ) &&
+      revTagSet.has(maxItem.tag) &&
       Math.abs(primary.valM) > 0 &&
       Math.abs(maxItem.valM) > Math.abs(primary.valM) * 1.5
     ) {
@@ -1857,6 +1965,204 @@ function getSecAnnualFactBest(factsObj, tagCandidates, targetYear, isInstant, fy
     }
   }
   return primary;
+}
+
+// [신규 감사 A·B] 동일 시트 다개년 동일 수치 중복 행 탐지 & BS 주식수(sharesItemType) 혼입 탐지
+function auditStructuralAnomalies(ticker, sheets, translations = null) {
+  const failures = [];
+  const segOf = (lbl) => {
+    const m = String(lbl || '').match(/^(\[[^\]]+\])\s+/);
+    return m ? m[1] : '';
+  };
+  const isSubtotalRow = (r) =>
+    Boolean(
+      r.isBold ||
+        /^\[.*\]$/.test(r.label) ||
+        /(?:손익|비용|수익|자산|부채|자본|투자|현금흐름)\s*합계$/.test(r.label)
+    );
+  const isEpsOrShares = (lbl) => /주당순이익|발행주식수|주식수/i.test(lbl);
+  const isIsCoreSummary = (lbl) =>
+    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익/i.test(
+      lbl
+    );
+  const isSoleActiveComponentOfSubtotal = (rows, idxA, idxB, matchedYearIndices, yearsLength) => {
+    const lo = Math.min(idxA, idxB);
+    const hi = Math.max(idxA, idxB);
+    if (!isSubtotalRow(rows[hi]) || isSubtotalRow(rows[lo])) return false;
+    let prevSub = -1;
+    for (let k = hi - 1; k >= 0; k--) {
+      if (isSubtotalRow(rows[k])) {
+        prevSub = k;
+        break;
+      }
+    }
+    if (lo <= prevSub) return false;
+    for (let startIdx = prevSub + 1; startIdx <= lo; startIdx++) {
+      const compRows = [];
+      for (let k = startIdx; k < hi; k++) {
+        if (!isSubtotalRow(rows[k])) compRows.push({ idx: k, row: rows[k] });
+      }
+      if (compRows.length === 0) continue;
+      let othersOk = true;
+      for (const yi of matchedYearIndices) {
+        let othersSum = 0;
+        for (const c of compRows) {
+          if (c.idx === lo) continue;
+          othersSum += c.row.values[yi] ?? 0;
+        }
+        if (Math.abs(othersSum) > 2) {
+          othersOk = false;
+          break;
+        }
+      }
+      if (!othersOk) continue;
+      const tol = Math.max(3, Math.ceil((compRows.length + 1) * 0.5));
+      let allYearsOk = true;
+      for (let yi = 0; yi < yearsLength; yi++) {
+        const subVal = rows[hi].values[yi];
+        const compVal = rows[lo].values[yi];
+        if (subVal === null || compVal === null) continue;
+        let fullSum = 0;
+        for (const c of compRows) fullSum += c.row.values[yi] ?? 0;
+        if (Math.abs(fullSum - subVal) > tol) {
+          allYearsOk = false;
+          break;
+        }
+      }
+      if (allYearsOk) return true;
+    }
+    return false;
+  };
+
+  // Rule B: BS 내 주식수(sharesItemType) 라벨·태그 혼입 탐지
+  const flaggedBsRows = new Set();
+  const bs = sheets['재무상태표'];
+  if (bs) {
+    for (const row of bs.rows) {
+      if (
+        /주식수|주수|\bauthorized\s+shares\b|\bissued\s+shares\b|\boutstanding\s+shares\b|\btreasury.*shares\b/i.test(
+          row.label
+        )
+      ) {
+        flaggedBsRows.add(row.rowIndex);
+        failures.push(
+          makeFailure(
+            ticker,
+            'STRUCTURAL_ANOMALY',
+            '구조/중복 이상',
+            '재무상태표',
+            `ALL(${row.rowIndex}행)`,
+            row.label,
+            '재무상태표(BS) 내 주식수(비금액) 행 혼입',
+            'BS에는 금액(USD) 행만 포함 (sharesItemType 배제)'
+          )
+        );
+      }
+    }
+  }
+  if (translations?.entries) {
+    for (const entry of translations.entries) {
+      if (entry.sheetName !== '재무상태표') continue;
+      if (flaggedBsRows.has(entry.rowIndex)) continue;
+      if (/(?:SharesAuthorized|SharesIssued|SharesOutstanding|TreasuryStock(?:Common|Preferred)?Shares)$/i.test(entry.xbrlTag || '')) {
+        flaggedBsRows.add(entry.rowIndex);
+        failures.push(
+          makeFailure(
+            ticker,
+            'STRUCTURAL_ANOMALY',
+            '구조/중복 이상',
+            '재무상태표',
+            `ALL(${entry.rowIndex}행)`,
+            `${entry.korName} (${entry.xbrlTag})`,
+            '재무상태표(BS) 내 주식수(sharesItemType) 태그 행 혼입',
+            'BS에는 금액(USD) 태그 행만 포함'
+          )
+        );
+      }
+    }
+  }
+
+  // Rule A: 동일 시트 내 5개년 이상 0이 아닌 수치가 100% 동일한 중복 행 탐지
+  for (const sheetName of SHEET_NAMES) {
+    const sheet = sheets[sheetName];
+    if (!sheet) continue;
+    const { rows, years } = sheet;
+    const bsAssetsTotalIdx =
+      sheetName === '재무상태표'
+        ? rows.findIndex(
+            (r) =>
+              r.label === '[[자산총계]]' ||
+              (/^\[*자산총계\]*$|^총자산$/i.test(r.label) && !/부채/.test(r.label))
+          )
+        : -1;
+    const cfNetChangeIdx =
+      sheetName === '현금흐름표'
+        ? rows.findIndex((r) => /현금및현금성자산의\s*순증감|현금.*순증감/.test(r.label))
+        : -1;
+    for (let i = 0; i < rows.length; i++) {
+      for (let j = i + 1; j < rows.length; j++) {
+        const ra = rows[i];
+        const rb = rows[j];
+        if (segOf(ra.label) !== segOf(rb.label)) continue;
+        if (ra.isBold && rb.isBold) continue;
+        if (isEpsOrShares(ra.label) && isEpsOrShares(rb.label)) continue;
+        if (sheetName === '손익계산서' && isIsCoreSummary(ra.label) && isIsCoreSummary(rb.label)) continue;
+        if (sheetName === '현금흐름표' && (/기초|기말/.test(ra.label) || /기초|기말/.test(rb.label))) continue;
+        if (sheetName === '현금흐름표' && cfNetChangeIdx !== -1 && i > cfNetChangeIdx && j > cfNetChangeIdx) {
+          continue;
+        }
+        if (sheetName === '재무상태표' && bsAssetsTotalIdx !== -1 && i < bsAssetsTotalIdx && j > bsAssetsTotalIdx) {
+          continue;
+        }
+        if (
+          sheetName === '재무상태표' &&
+          ((/지배기업주주지분|지배주주지분/.test(ra.label) && /자본총계/.test(rb.label)) ||
+            (/지배기업주주지분|지배주주지분/.test(rb.label) && /자본총계/.test(ra.label)))
+        ) {
+          continue;
+        }
+
+        let matchedCount = 0;
+        const matchedYearIndices = [];
+        const distinctVals = new Set();
+        for (let yi = 0; yi < years.length; yi++) {
+          const va = ra.values[yi];
+          const vb = rb.values[yi];
+          if (va !== null && vb !== null && va !== 0 && vb !== 0 && va === vb) {
+            matchedCount++;
+            matchedYearIndices.push(yi);
+            distinctVals.add(va);
+          }
+        }
+        if (
+          matchedCount >= 5 &&
+          distinctVals.size >= 2 &&
+          !isSoleActiveComponentOfSubtotal(rows, i, j, matchedYearIndices, years.length)
+        ) {
+          failures.push(
+            makeFailure(
+              ticker,
+              'STRUCTURAL_ANOMALY',
+              '구조/중복 이상',
+              sheetName,
+              `ALL(${ra.rowIndex}·${rb.rowIndex}행)`,
+              `${ra.label} ↔ ${rb.label}`,
+              `${matchedCount}개년 0 이외 수치 100% 동일 (예: ${Array.from(distinctVals)
+                .slice(0, 3)
+                .map(formatNum)
+                .join(', ')})`,
+              '독립 계정 간 5개년 이상 수치 중복 백필 없음'
+            )
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    status: failures.length === 0 ? 'PASS' : 'FAIL',
+    failures,
+  };
 }
 
 function auditSecGroundTruth(ticker, sheets, capture) {
@@ -2113,7 +2419,21 @@ function auditSecGroundTruth(ticker, sheets, capture) {
         continue;
       }
 
-      const secValM = secFact.valM;
+      let effectiveSecValM = secFact.valM;
+      let effectiveSecTagNote = '';
+      if (m.metric === '자본총계' && Array.isArray(secFact.allRecords) && secFact.filed) {
+        const secAssetsFactForYr = getSecAnnualFactBest(factsObj, ['Assets'], yr, true, fyeMonth);
+        if (secAssetsFactForYr?.filed && secFact.filed > secAssetsFactForYr.filed) {
+          const bsAligned = secFact.allRecords.filter(
+            (r) => r.filed && r.filed <= secAssetsFactForYr.filed
+          );
+          if (bsAligned.length > 0) {
+            effectiveSecValM = bsAligned[bsAligned.length - 1].valM;
+            effectiveSecTagNote = ' (BS동일공시기준)';
+          }
+        }
+      }
+      const secValM = effectiveSecValM;
       const secValRounded = Number(secValM.toFixed(1));
       const tol = Math.max(2, Math.abs(secValM) * 0.005);
 
@@ -2197,7 +2517,9 @@ function auditSecGroundTruth(ticker, sheets, capture) {
         year: String(yr),
         excelLabel: m.excelRow.label,
         excelVal,
-        secTag: matchesPrior10K ? `${secFact.tag} (원공시일치)` : secFact.tag,
+        secTag: matchesPrior10K
+          ? `${secFact.tag} (원공시일치)`
+          : `${secFact.tag}${effectiveSecTagNote}`,
         secValM: secValRounded,
         diff: Number(diff.toFixed(1)),
         status: isOk ? 'PASS' : 'FAIL',
@@ -2757,6 +3079,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
             BRK_STRUCTURE: { status: 'N/A', failures: [] },
             IS_INTEGRITY: { status: 'N/A', failures: [] },
             SEC_GROUND_TRUTH: { status: 'N/A', failures: [], comparisons: [], sampledYears: [] },
+            STRUCTURAL_ANOMALY: { status: 'N/A', failures: [] },
           },
           translations: { entries: [], duplicatesBySheet: [], matchedTagCount: 0, totalRows: 0 },
           allFailures: isGracefulKoreanError
@@ -2797,6 +3120,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
             BRK_STRUCTURE: { status: 'N/A', failures: [] },
             IS_INTEGRITY: { status: 'N/A', failures: [] },
             SEC_GROUND_TRUTH: { status: 'N/A', failures: [], comparisons: [], sampledYears: [] },
+            STRUCTURAL_ANOMALY: { status: 'N/A', failures: [] },
           },
           translations: { entries: [], duplicatesBySheet: [], matchedTagCount: 0, totalRows: 0 },
           allFailures: isGracefulFundError
@@ -2846,6 +3170,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
           BRK_STRUCTURE: { status: 'N/A', failures: [] },
           IS_INTEGRITY: { status: 'FAIL', failures: [] },
           SEC_GROUND_TRUTH: { status: 'FAIL', failures: [], comparisons: [], sampledYears: [] },
+          STRUCTURAL_ANOMALY: { status: 'FAIL', failures: [] },
         },
         translations: { entries: [], duplicatesBySheet: [], matchedTagCount: 0, totalRows: 0 },
         allFailures: [apiFail],
@@ -2878,6 +3203,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
     const c7 = auditIncomeStatementIntegrity(ticker, sheets);
     const c8 = auditSecGroundTruth(ticker, sheets, capture);
     const translations = buildTranslationMappings(sheets, capture);
+    const c9 = auditStructuralAnomalies(ticker, sheets, translations);
 
     const allFailures = [
       ...c1.failures,
@@ -2888,6 +3214,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
       ...c6.failures,
       ...c7.failures,
       ...c8.failures,
+      ...c9.failures,
     ];
 
     const overall =
@@ -2898,7 +3225,8 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
       c5.status === 'PASS' &&
       c6.status !== 'FAIL' &&
       c7.status === 'PASS' &&
-      c8.status === 'PASS'
+      c8.status === 'PASS' &&
+      c9.status === 'PASS'
         ? 'PASS'
         : 'FAIL';
 
@@ -2920,6 +3248,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
         BRK_STRUCTURE: c6,
         IS_INTEGRITY: c7,
         SEC_GROUND_TRUTH: c8,
+        STRUCTURAL_ANOMALY: c9,
       },
       translations,
       allFailures,
@@ -3065,12 +3394,12 @@ function writeMarkdownAuditReport(outPath, results, meta) {
   lines.push(`- Gemini 모드: ${meta.geminiMode}`);
   lines.push('');
 
-  lines.push('## 1. 종목별 종합 감사 결과 (검증 1~8)');
+  lines.push('## 1. 종목별 종합 감사 결과 (검증 1~8 + 구조/중복)');
   lines.push('');
   lines.push(
-    '| 종목 | 구분 | 소요(s) | 연도 | 행수(IS/BS/CF) | 1.BS항등식 | 2.주요소계 | 3.단위급변 | 4.유출부호 | 5.미번역 | 7.IS정합성 | 8.SEC원본대조 | 최종 |'
+    '| 종목 | 구분 | 소요(s) | 연도 | 행수(IS/BS/CF) | 1.BS항등식 | 2.주요소계 | 3.단위급변 | 4.유출부호 | 5.미번역 | 7.IS정합성 | 8.SEC원본대조 | 구조/중복 | 최종 |'
   );
-  lines.push('|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|');
+  lines.push('|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|');
   for (const r of results) {
     lines.push(
       `| ${r.ticker} | ${r.role} | ${r.elapsedSec} | ${r.yearRange} | ${r.rowCounts} | ${formatCheckCell(
@@ -3081,21 +3410,21 @@ function writeMarkdownAuditReport(outPath, results, meta) {
         r.checks.UNTRANSLATED
       )} | ${formatCheckCell(r.checks.IS_INTEGRITY)} | ${formatCheckCell(
         r.checks.SEC_GROUND_TRUTH
-      )} | **${r.overall}** |`
+      )} | ${formatCheckCell(r.checks.STRUCTURAL_ANOMALY)} | **${r.overall}** |`
     );
   }
   lines.push('');
 
   lines.push('## 2. 검증 2 (주요 소계 합산) 세부 상태');
   lines.push('');
-  lines.push('| 종목 | 유동자산 | 유동부채 | 영업CF | 투자CF | 재무CF |');
-  lines.push('|---|---|---|---|---|---|');
+  lines.push('| 종목 | 유동자산 | 비유동자산 | 유동부채 | 비유동부채 | 영업CF | 투자CF | 재무CF |');
+  lines.push('|---|---|---|---|---|---|---|---|');
   for (const r of results) {
     const b = r.checks.SUBTOTALS?.breakdown || {};
     lines.push(
-      `| ${r.ticker} | ${b['유동자산'] || '-'} | ${b['유동부채'] || '-'} | ${
-        b['영업현금흐름'] || '-'
-      } | ${b['투자현금흐름'] || '-'} | ${b['재무현금흐름'] || '-'} |`
+      `| ${r.ticker} | ${b['유동자산'] || '-'} | ${b['비유동자산'] || '-'} | ${b['유동부채'] || '-'} | ${
+        b['비유동부채'] || '-'
+      } | ${b['영업현금흐름'] || '-'} | ${b['투자현금흐름'] || '-'} | ${b['재무현금흐름'] || '-'} |`
     );
   }
   lines.push('');
@@ -3251,6 +3580,7 @@ async function main() {
           BRK_STRUCTURE: { status: 'N/A', failures: [] },
           IS_INTEGRITY: { status: 'FAIL', failures: [] },
           SEC_GROUND_TRUTH: { status: 'FAIL', failures: [], comparisons: [], sampledYears: [] },
+          STRUCTURAL_ANOMALY: { status: 'FAIL', failures: [] },
         },
         translations: { entries: [], duplicatesBySheet: [], matchedTagCount: 0, totalRows: 0 },
         allFailures: [makeFailure(ticker, 'CRASH', '실행 예외', '-', 'ALL', '(예외)', errMsg, '정상 완료')],
@@ -3279,6 +3609,7 @@ async function main() {
     { header: '5.미번역', width: 9 },
     { header: '7.IS정합', width: 9 },
     { header: '8.SEC대조', width: 10 },
+    { header: '구조/중복', width: 10 },
     { header: '최종', width: 11 },
   ];
   const headerLine = cols.map((c) => padEndDisplay(c.header, c.width)).join(' | ');
@@ -3296,7 +3627,8 @@ async function main() {
         padEndDisplay(formatCheckCell(r.checks.UNTRANSLATED), cols[6].width),
         padEndDisplay(formatCheckCell(r.checks.IS_INTEGRITY), cols[7].width),
         padEndDisplay(formatCheckCell(r.checks.SEC_GROUND_TRUTH), cols[8].width),
-        padEndDisplay(r.overall, cols[9].width),
+        padEndDisplay(formatCheckCell(r.checks.STRUCTURAL_ANOMALY), cols[9].width),
+        padEndDisplay(r.overall, cols[10].width),
       ].join(' | ')
     );
   }
