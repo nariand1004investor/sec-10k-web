@@ -340,7 +340,29 @@ function auditBalanceSheetIdentity(ticker, sheets) {
           break;
         }
         if (/주식수|shares/i.test(lbl)) continue;
-        if (/^\[비유동부채\s*합계\]$/i.test(lbl)) continue;
+        if (/^\[.*합계\]$/i.test(lbl)) continue;
+        if (rows[i].isBold && nonCurrLiabRows.length > 0) {
+          let isIntermediateSub = false;
+          for (let start = 0; start < nonCurrLiabRows.length; start++) {
+            const slice = nonCurrLiabRows.slice(start);
+            if (slice.length < 2 && !/^total\b|합계$/i.test(lbl)) continue;
+            const tol = Math.max(3, Math.ceil((slice.length + 1) * 0.5));
+            let checked = 0;
+            let matched = 0;
+            for (let yi = 0; yi < years.length; yi++) {
+              const candVal = rows[i].values[yi];
+              if (candVal === null) continue;
+              const sliceSum = slice.reduce((acc, r) => acc + (r.values[yi] ?? 0), 0);
+              checked++;
+              if (Math.abs(sliceSum - candVal) <= tol) matched++;
+            }
+            if (checked > 0 && matched === checked) {
+              isIntermediateSub = true;
+              break;
+            }
+          }
+          if (isIntermediateSub) continue;
+        }
         nonCurrLiabRows.push(rows[i]);
       }
       if (nonCurrLiabRows.length > 0) {
@@ -780,7 +802,7 @@ function auditMajorSubtotals(ticker, sheets) {
       const nclIdx = findIdx(
         bsRows,
         '[비유동부채 합계]',
-        /비유동부채\s*합계|^total (?:non-?current|long-?term) liabilities$/i
+        /^\[?비유동부채\s*합계\]?$|^total (?:non-?current|long-?term) liabilities$/i
       );
       if (nclIdx !== -1 && clIdx !== -1 && nclIdx > clIdx) {
         const nclCompRows = bsRows
@@ -1840,7 +1862,7 @@ function auditStructuralAnomalies(ticker, sheets) {
     );
   const isEpsOrShares = (lbl) => /주당순이익|발행주식수|주식수/i.test(lbl);
   const isIsCoreSummary = (lbl) =>
-    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익/i.test(
+    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|포괄손익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손익/i.test(
       lbl
     );
   const isSoleActiveComponentOfSubtotal = (rows, idxA, idxB, matchedYearIndices, yearsLength) => {

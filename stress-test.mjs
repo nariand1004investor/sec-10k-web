@@ -558,7 +558,29 @@ function auditBalanceSheetIdentity(ticker, sheets) {
           break;
         }
         if (/주식수|shares/i.test(lbl)) continue;
-        if (/^\[비유동부채\s*합계\]$/i.test(lbl)) continue;
+        if (/^\[.*합계\]$/i.test(lbl)) continue;
+        if (rows[i].isBold && nonCurrLiabRows.length > 0) {
+          let isIntermediateSub = false;
+          for (let start = 0; start < nonCurrLiabRows.length; start++) {
+            const slice = nonCurrLiabRows.slice(start);
+            if (slice.length < 2 && !/^total\b|합계$/i.test(lbl)) continue;
+            const tol = Math.max(3, Math.ceil((slice.length + 1) * 0.5));
+            let checked = 0;
+            let matched = 0;
+            for (let yi = 0; yi < years.length; yi++) {
+              const candVal = rows[i].values[yi];
+              if (candVal === null) continue;
+              const sliceSum = slice.reduce((acc, r) => acc + (r.values[yi] ?? 0), 0);
+              checked++;
+              if (Math.abs(sliceSum - candVal) <= tol) matched++;
+            }
+            if (checked > 0 && matched === checked) {
+              isIntermediateSub = true;
+              break;
+            }
+          }
+          if (isIntermediateSub) continue;
+        }
         nonCurrLiabRows.push(rows[i]);
       }
       if (nonCurrLiabRows.length > 0) {
@@ -996,7 +1018,7 @@ function auditMajorSubtotals(ticker, sheets) {
       const nclIdx = findIdx(
         bsRows,
         '[비유동부채 합계]',
-        /비유동부채\s*합계|^total (?:non-?current|long-?term) liabilities$/i
+        /^\[?비유동부채\s*합계\]?$|^total (?:non-?current|long-?term) liabilities$/i
       );
       if (nclIdx !== -1 && clIdx !== -1 && nclIdx > clIdx) {
         const nclCompRows = bsRows
@@ -1415,7 +1437,7 @@ function auditBrkAStructure(ticker, sheets) {
 }
 
 // [검증 7] 손익계산서 정합성·부호·연간매출 급변 감사 (Tax Benefit 정상 환급 허용)
-function auditIncomeStatementIntegrity(ticker, sheets) {
+function auditIncomeStatementIntegrity(ticker, sheets, capture = null) {
   const failures = [];
   const is = sheets['손익계산서'];
   if (!is || is.rows.length === 0) {
@@ -1826,12 +1848,39 @@ function auditIncomeStatementIntegrity(ticker, sheets) {
   const primaryRevRowIdx = revIdx !== -1 ? revIdx : netRevIdx;
   if (primaryRevRowIdx !== -1) {
     const rRow = mainRows[primaryRevRowIdx];
+    const factsObj = capture?.companyFacts?.facts;
+    const fyeMonth = getFiscalYearEndMonth(capture?.submissions);
+    const revSecTags = [
+      'Revenues',
+      'RevenueFromContractWithCustomerExcludingAssessedTax',
+      'RevenueFromContractWithCustomerIncludingAssessedTax',
+      'SalesRevenueNet',
+      'RevenuesNetOfInterestExpense',
+      'RegulatedAndUnregulatedOperatingRevenue',
+      'ElectricUtilityRevenue',
+      'OilAndGasRevenue',
+      'SalesRevenueGoodsNet',
+    ];
+    const matchesSecAnnualRev = (yr, excelVal) => {
+      if (!factsObj?.['us-gaap']) return false;
+      for (const tag of revSecTags) {
+        const fact = getSecAnnualFactValueForTag(factsObj, tag, yr, false, fyeMonth);
+        if (!fact || !(fact.valM > 0)) continue;
+        if (Math.abs(excelVal - fact.valM) <= Math.max(2, Math.abs(fact.valM) * 0.01)) {
+          return true;
+        }
+      }
+      return false;
+    };
     for (let i = 1; i < years.length; i++) {
       const prev = rRow.values[i - 1];
       const curr = rRow.values[i];
       if (prev === null || curr === null || prev <= 0 || curr <= 0) continue;
       const ratio = Math.max(prev, curr) / Math.min(prev, curr);
       if (ratio >= 3.0) {
+        if (matchesSecAnnualRev(years[i - 1], prev) && matchesSecAnnualRev(years[i], curr)) {
+          continue;
+        }
         pushFail(
           `${years[i - 1]}→${years[i]}`,
           `${rRow.label} (매출 급변)`,
@@ -1982,7 +2031,7 @@ function auditStructuralAnomalies(ticker, sheets, translations = null) {
     );
   const isEpsOrShares = (lbl) => /주당순이익|발행주식수|주식수/i.test(lbl);
   const isIsCoreSummary = (lbl) =>
-    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익/i.test(
+    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|포괄손익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손익/i.test(
       lbl
     );
   const isSoleActiveComponentOfSubtotal = (rows, idxA, idxB, matchedYearIndices, yearsLength) => {
@@ -3014,6 +3063,18 @@ function detect1940ActFundIssuer(capture) {
   return !has10K && hasFundForm;
 }
 
+function detectPre10KIpoIssuer(capture) {
+  const recentForms = capture?.submissions?.filings?.recent?.form || [];
+  if (!Array.isArray(recentForms) || recentForms.length === 0) return false;
+  const has10K = recentForms.some((f) => /^10-K/i.test(f));
+  const has20F = recentForms.some((f) => /^(?:20-F|40-F)/i.test(f));
+  const hasFundForm = recentForms.some((f) => /^(?:N-CSR|N-CSRS|N-CEN|NPORT-P|N-Q)(?:\/A)?$/i.test(f));
+  const hasIpoOrQuarterly = recentForms.some((f) =>
+    /^(?:S-1|S-1\/A|S-4|S-4\/A|424B[1-4]|10-Q|10-Q\/A|8-A12B|F-1|F-1\/A)$/i.test(f)
+  );
+  return !has10K && !has20F && !hasFundForm && hasIpoOrQuarterly;
+}
+
 async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
   activeCapture = createEmptyCapture();
   const startedAt = Date.now();
@@ -3048,6 +3109,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
 
       const isForeign20F = detect20FIssuer(capture);
       const isNon10KFund = !isForeign20F && detect1940ActFundIssuer(capture);
+      const isPre10KIpo = !isForeign20F && !isNon10KFund && detectPre10KIpoIssuer(capture);
       const isGracefulKoreanError =
         Boolean(parsedError) &&
         /[가-힣]/.test(parsedError) &&
@@ -3057,6 +3119,11 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
         Boolean(parsedError) &&
         /[가-힣]/.test(parsedError) &&
         /(?:N-CSR|펀드|투자회사)/i.test(parsedError) &&
+        res.status === 422;
+      const isGracefulPre10KError =
+        Boolean(parsedError) &&
+        /[가-힣]/.test(parsedError) &&
+        /(?:IPO|신규\s*상장|10-K)/i.test(parsedError) &&
         res.status === 422;
 
       if (isForeign20F) {
@@ -3141,6 +3208,48 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
         };
       }
 
+      if (isPre10KIpo) {
+        return {
+          ticker,
+          role: TICKER_ROLE_LABELS[ticker] || '신규상장(10-K미공시)',
+          elapsedSec,
+          yearRange: '-',
+          rowCounts: '-',
+          isForeign20F: false,
+          isNon10KFund: false,
+          isPre10KIpo: true,
+          httpStatus: res.status,
+          apiError: errMsg,
+          checks: {
+            BS_IDENTITY: { status: 'N/A', failures: [] },
+            SUBTOTALS: { status: 'N/A', failures: [], breakdown: {} },
+            SCALE_JUMP: { status: 'N/A', failures: [] },
+            OUTFLOW_SIGN: { status: 'N/A', failures: [] },
+            UNTRANSLATED: { status: 'N/A', failures: [] },
+            BRK_STRUCTURE: { status: 'N/A', failures: [] },
+            IS_INTEGRITY: { status: 'N/A', failures: [] },
+            SEC_GROUND_TRUTH: { status: 'N/A', failures: [], comparisons: [], sampledYears: [] },
+            STRUCTURAL_ANOMALY: { status: 'N/A', failures: [] },
+          },
+          translations: { entries: [], duplicatesBySheet: [], matchedTagCount: 0, totalRows: 0 },
+          allFailures: isGracefulPre10KError
+            ? []
+            : [
+                makeFailure(
+                  ticker,
+                  'PRE_10K_IPO',
+                  '신규상장(10-K미공시) 예외처리',
+                  '-',
+                  'ALL',
+                  '10-K 미공시 안내',
+                  errMsg,
+                  'HTTP 422 및 신규상장 10-K 미공시 한글 안내 메시지 JSON 반환'
+                ),
+              ],
+          overall: isGracefulPre10KError ? 'PRE-10K(PASS)' : 'PRE-10K(FAIL)',
+        };
+      }
+
       const apiFail = makeFailure(
         ticker,
         'API_ERROR',
@@ -3200,7 +3309,7 @@ async function analyzeAndStressAuditTicker(ticker, apiKey, userEmail) {
     const c4 = auditCashOutflowSigns(ticker, sheets);
     const c5 = auditUntranslatedLabels(ticker, sheets);
     const c6 = auditBrkAStructure(ticker, sheets);
-    const c7 = auditIncomeStatementIntegrity(ticker, sheets);
+    const c7 = auditIncomeStatementIntegrity(ticker, sheets, capture);
     const c8 = auditSecGroundTruth(ticker, sheets, capture);
     const translations = buildTranslationMappings(sheets, capture);
     const c9 = auditStructuralAnomalies(ticker, sheets, translations);
@@ -3444,6 +3553,12 @@ function writeMarkdownAuditReport(outPath, results, meta) {
       lines.push('');
       continue;
     }
+    if (r.isPre10KIpo) {
+      lines.push(`### ${r.ticker} (${r.role})`);
+      lines.push(`- **신규 상장(첫 10-K 미공시) 예외 응답 확인**: \`${r.apiError}\` (판정: **${r.overall}**)`);
+      lines.push('');
+      continue;
+    }
     if (r.apiError) {
       lines.push(`### ${r.ticker} (${r.role})`);
       lines.push(`- **API 오류**: \`${r.apiError}\``);
@@ -3635,10 +3750,14 @@ async function main() {
 
   const totalFailures = results.reduce((acc, r) => acc + r.allFailures.length, 0);
   const passCount = results.filter(
-    (r) => r.overall === 'PASS' || r.overall === '20-F(PASS)' || r.overall === 'FUND(PASS)'
+    (r) =>
+      r.overall === 'PASS' ||
+      r.overall === '20-F(PASS)' ||
+      r.overall === 'FUND(PASS)' ||
+      r.overall === 'PRE-10K(PASS)'
   ).length;
   console.log('\n----------------------------------------------------------------------------------------------------');
-  console.log(` 최종 집계: ${passCount}/${results.length} PASS(20-F/펀드 정상예외 포함) | 총 FAIL: ${totalFailures}건`);
+  console.log(` 최종 집계: ${passCount}/${results.length} PASS(20-F/펀드/신규IPO 정상예외 포함) | 총 FAIL: ${totalFailures}건`);
   console.log(` 저장 완료: ${opts.reportPath} , ${opts.translationsPath}`);
   console.log('====================================================================================================');
 
