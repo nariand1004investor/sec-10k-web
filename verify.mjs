@@ -811,7 +811,9 @@ function auditMajorSubtotals(ticker, sheets) {
           .filter(
             (r) =>
               !/^\[.*\]$/.test(r.label) &&
-              !/상환가능|메자닌|redeemable|temporary\s+equity/i.test(r.label)
+              !/상환가능|메자닌|화해대상|redeemable|temporary\s+equity|liabilities\s+subject\s+to\s+compromise/i.test(
+                r.label
+              )
           );
         if (nclCompRows.length > 0) {
           evaluateSubtotal({
@@ -936,6 +938,39 @@ function auditMajorSubtotals(ticker, sheets) {
               ) {
                 verifiedWaterfall = true;
                 break;
+              }
+            } else if (leadSlice.length >= 4 && leadSlice.length <= 6) {
+              let lastNetIdxInLead = -1;
+              for (let li = leadSlice.length - 1; li >= 0; li--) {
+                if (/^(?:연결)?당기순이익$|^총?순이익$/i.test(leadSlice[li].label || '')) {
+                  lastNetIdxInLead = li;
+                  break;
+                }
+              }
+              if (lastNetIdxInLead > 0 && lastNetIdxInLead < leadSlice.length - 1) {
+                const subNetVal = leadSlice[lastNetIdxInLead].values[yi];
+                const tailSlice = leadSlice.slice(lastNetIdxInLead + 1);
+                if (subNetVal !== null && tailSlice.length <= 2) {
+                  if (tailSlice.length === 1) {
+                    const b1 = tailSlice[0].values[yi] ?? 0;
+                    if (Math.abs(subNetVal + b1 - cVal) <= 3 || Math.abs(subNetVal - b1 - cVal) <= 3) {
+                      verifiedWaterfall = true;
+                      break;
+                    }
+                  } else if (tailSlice.length === 2) {
+                    const b1 = tailSlice[0].values[yi] ?? 0;
+                    const b2 = tailSlice[1].values[yi] ?? 0;
+                    if (
+                      Math.abs(subNetVal + b1 + b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal - b1 - b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal - b1 + b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal + b1 - b2 - cVal) <= 3
+                    ) {
+                      verifiedWaterfall = true;
+                      break;
+                    }
+                  }
+                }
               }
             }
           }
@@ -2120,6 +2155,9 @@ function auditStructuralAnomalies(ticker, sheets) {
         if (segOf(ra.label) !== segOf(rb.label)) continue;
         if (ra.isBold && rb.isBold) continue;
         if (isEpsOrShares(ra.label) && isEpsOrShares(rb.label)) continue;
+        const isDivPerShare = (lbl) =>
+          /주당.*배당|배당.*주당|dividends?.*per\s+share/i.test(String(lbl || ''));
+        if (sheetName === '손익계산서' && isDivPerShare(ra.label) && isDivPerShare(rb.label)) continue;
         if (sheetName === '손익계산서' && isIsCoreSummary(ra.label) && isIsCoreSummary(rb.label)) continue;
         if (sheetName === '현금흐름표' && (/기초|기말/.test(ra.label) || /기초|기말/.test(rb.label))) continue;
         if (sheetName === '현금흐름표' && cfNetChangeIdx !== -1 && (i > cfNetChangeIdx || j > cfNetChangeIdx)) {

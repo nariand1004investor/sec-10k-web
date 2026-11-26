@@ -1026,7 +1026,9 @@ function auditMajorSubtotals(ticker, sheets) {
           .filter(
             (r) =>
               !/^\[.*\]$/.test(r.label) &&
-              !/상환가능|메자닌|redeemable|temporary\s+equity/i.test(r.label)
+              !/상환가능|메자닌|화해대상|redeemable|temporary\s+equity|liabilities\s+subject\s+to\s+compromise/i.test(
+                r.label
+              )
           );
         if (nclCompRows.length > 0) {
           evaluateSubtotal({
@@ -1108,6 +1110,17 @@ function auditMajorSubtotals(ticker, sheets) {
           idx < opIdx &&
           /^(?:연결)?당기순이익$|^총?순이익$|^net\s+(?:income|earnings)/i.test(r.label)
       );
+      const preContOpsIdx =
+        netIncIdx !== -1
+          ? cfRows.findIndex(
+              (r, idx) =>
+                idx >= opStartBound &&
+                idx < netIncIdx &&
+                /^계속영업(?:순|당기)?손?이익$|계속영업.*(?:당기순이익|순손실|순이익)|income\s*\(?loss\)?\s*from\s+continuing\s+operations/i.test(
+                  r.label
+                )
+            )
+          : -1;
       const contOpsIdx = cfRows.findIndex(
         (r, idx) =>
           idx >= opStartBound &&
@@ -1119,7 +1132,7 @@ function auditMajorSubtotals(ticker, sheets) {
       );
       let effectiveOpStart = -1;
       if (netIncIdx !== -1) {
-        effectiveOpStart = netIncIdx;
+        effectiveOpStart = preContOpsIdx !== -1 ? preContOpsIdx : netIncIdx;
         if (contOpsIdx > netIncIdx && contOpsIdx <= Math.min(opIdx - 1, netIncIdx + 5)) {
           const leadSlice = cfRows.slice(netIncIdx, contOpsIdx);
           let verifiedWaterfall = false;
@@ -1148,6 +1161,39 @@ function auditMajorSubtotals(ticker, sheets) {
               ) {
                 verifiedWaterfall = true;
                 break;
+              }
+            } else if (leadSlice.length >= 4 && leadSlice.length <= 6) {
+              let lastNetIdxInLead = -1;
+              for (let li = leadSlice.length - 1; li >= 0; li--) {
+                if (/^(?:연결)?당기순이익$|^총?순이익$/i.test(leadSlice[li].label || '')) {
+                  lastNetIdxInLead = li;
+                  break;
+                }
+              }
+              if (lastNetIdxInLead > 0 && lastNetIdxInLead < leadSlice.length - 1) {
+                const subNetVal = leadSlice[lastNetIdxInLead].values[yi];
+                const tailSlice = leadSlice.slice(lastNetIdxInLead + 1);
+                if (subNetVal !== null && tailSlice.length <= 2) {
+                  if (tailSlice.length === 1) {
+                    const b1 = tailSlice[0].values[yi] ?? 0;
+                    if (Math.abs(subNetVal + b1 - cVal) <= 3 || Math.abs(subNetVal - b1 - cVal) <= 3) {
+                      verifiedWaterfall = true;
+                      break;
+                    }
+                  } else if (tailSlice.length === 2) {
+                    const b1 = tailSlice[0].values[yi] ?? 0;
+                    const b2 = tailSlice[1].values[yi] ?? 0;
+                    if (
+                      Math.abs(subNetVal + b1 + b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal - b1 - b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal - b1 + b2 - cVal) <= 3 ||
+                      Math.abs(subNetVal + b1 - b2 - cVal) <= 3
+                    ) {
+                      verifiedWaterfall = true;
+                      break;
+                    }
+                  }
+                }
               }
             }
           }
@@ -2319,6 +2365,9 @@ function auditStructuralAnomalies(ticker, sheets, translations = null) {
         if (segOf(ra.label) !== segOf(rb.label)) continue;
         if (ra.isBold && rb.isBold) continue;
         if (isEpsOrShares(ra.label) && isEpsOrShares(rb.label)) continue;
+        const isDivPerShare = (lbl) =>
+          /주당.*배당|배당.*주당|dividends?.*per\s+share/i.test(String(lbl || ''));
+        if (sheetName === '손익계산서' && isDivPerShare(ra.label) && isDivPerShare(rb.label)) continue;
         if (sheetName === '손익계산서' && isIsCoreSummary(ra.label) && isIsCoreSummary(rb.label)) continue;
         if (sheetName === '현금흐름표' && (/기초|기말/.test(ra.label) || /기초|기말/.test(rb.label))) continue;
         const normLbl = (lbl) => String(lbl || '').replace(/\s+/g, '');
@@ -2441,6 +2490,23 @@ function auditSecGroundTruth(ticker, sheets, capture) {
     /^(?:총)?매출액$|^영업수익$|^총수익$/i,
     /원가|비용|차감전/
   );
+  let virtualBankRevRow = null;
+  if (!revRow && is?.rows) {
+    const netIntIncRow = findRow(is, ['순이자손익']);
+    const nonIntIncRow = findRow(is, ['비이자수익합계']);
+    if (netIntIncRow && nonIntIncRow) {
+      virtualBankRevRow = {
+        label: '순영업수익(순이자+비이자 산출)',
+        values: is.years.map((_, yi) => {
+          const ni = netIntIncRow.values[yi];
+          const non = nonIntIncRow.values[yi];
+          return ni !== null && non !== null ? ni + non : null;
+        }),
+      };
+    }
+  }
+  const effectiveRevRow = revRow || virtualBankRevRow;
+  const isVirtualBankRevenue = !revRow && Boolean(virtualBankRevRow);
   const findBestPopulatedRow = (sheet, exactList, fallbackRegex, excludeRegex = null) => {
     if (!sheet || !sheet.rows) return null;
     const nonSeg = sheet.rows.filter((r) => !/^\[.*\]/.test(r.label));
@@ -2497,7 +2563,7 @@ function auditSecGroundTruth(ticker, sheets, capture) {
   };
 
   const refYears = is?.years || bs?.years || cf?.years || [];
-  const coreRowsForYrScan = [revRow, netIncRow, assetsRow, equityRow, ocfRow];
+  const coreRowsForYrScan = [effectiveRevRow, netIncRow, assetsRow, equityRow, ocfRow];
   const populatedIndices = [];
   for (let yi = 0; yi < refYears.length; yi++) {
     const presentCnt = coreRowsForYrScan.filter((r) => r && r.values[yi] !== null).length;
@@ -2520,15 +2586,15 @@ function auditSecGroundTruth(ticker, sheets, capture) {
 
   const sampledYears = sampleIndices.map((yi) => refYears[yi]);
 
-  const isBankRevenue = revRow?.label === '순영업수익(이자비용차감후총수익)';
+  const isBankRevenue = effectiveRevRow?.label === '순영업수익(이자비용차감후총수익)';
   const metrics = [
     {
       metric: '매출액',
       sheetName: '손익계산서',
       sheetObj: is,
-      excelRow: revRow,
+      excelRow: effectiveRevRow,
       isInstant: false,
-      preferMaxOverride: !isBankRevenue,
+      preferMaxOverride: !isBankRevenue && !isVirtualBankRevenue,
       tagCandidates: isBankRevenue
         ? [
             'RevenuesNetOfInterestExpense',
@@ -2536,6 +2602,8 @@ function auditSecGroundTruth(ticker, sheets, capture) {
             'RevenueFromContractWithCustomerExcludingAssessedTax',
             'SalesRevenueNet',
           ]
+        : isVirtualBankRevenue
+        ? ['RevenuesNetOfInterestExpense', 'Revenues']
         : [
             'Revenues',
             'RegulatedAndUnregulatedOperatingRevenue',
@@ -2670,14 +2738,42 @@ function auditSecGroundTruth(ticker, sheets, capture) {
         ? m.resolveTagCandidates(yr, sheetYi)
         : m.tagCandidates;
 
-      const secFact = getSecAnnualFactBest(
-        factsObj,
-        candidates,
-        yr,
-        m.isInstant,
-        fyeMonth,
-        m.preferMaxOverride
-      );
+      let secFact = null;
+      if (m.metric === '매출액' && isVirtualBankRevenue) {
+        const niiFact = getSecAnnualFactBest(
+          factsObj,
+          ['InterestIncomeExpenseNet'],
+          yr,
+          false,
+          fyeMonth,
+          false
+        );
+        const nonIntFact = getSecAnnualFactBest(
+          factsObj,
+          ['NoninterestIncome'],
+          yr,
+          false,
+          fyeMonth,
+          false
+        );
+        if (niiFact && nonIntFact) {
+          secFact = {
+            tag: 'InterestIncomeExpenseNet+NoninterestIncome',
+            valM: niiFact.valM + nonIntFact.valM,
+            filed: niiFact.filed || nonIntFact.filed,
+          };
+        }
+      }
+      if (!secFact) {
+        secFact = getSecAnnualFactBest(
+          factsObj,
+          candidates,
+          yr,
+          m.isInstant,
+          fyeMonth,
+          m.preferMaxOverride
+        );
+      }
 
       if (!secFact) {
         comparisons.push({
