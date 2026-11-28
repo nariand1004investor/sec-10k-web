@@ -469,6 +469,32 @@ function auditBalanceSheetIdentity(ticker, sheets) {
     return { status: 'FAIL', failures, checkedYears: 0 };
   }
 
+  const positionalMezzRows = [];
+  const liabRowIdxForMezz = rows.indexOf(liabRow);
+  const eqRowIdxForMezz = rows.indexOf(equityRow);
+  if (liabRowIdxForMezz !== -1 && eqRowIdxForMezz > liabRowIdxForMezz + 1) {
+    for (let i = liabRowIdxForMezz + 1; i < eqRowIdxForMezz; i++) {
+      const lbl = rows[i].label;
+      if (
+        /^(?:보통주|우선주|자본금|자본잉여금|이익잉여금|결손금|기타포괄|자기주식|지배기업|비지배|\[\[자본총계\]\])/i.test(
+          lbl
+        ) &&
+        !/상환가능|메자닌|임시자본|redeemable|temporary/i.test(lbl) &&
+        !/주식수|shares/i.test(lbl)
+      ) {
+        break;
+      }
+      if (
+        !rows[i].isBold &&
+        !/^\[.*\]$/.test(lbl) &&
+        !mezzanineRows.includes(rows[i]) &&
+        !/주식수|shares/i.test(lbl)
+      ) {
+        positionalMezzRows.push(rows[i]);
+      }
+    }
+  }
+
   let checkedYears = 0;
   for (let yi = 0; yi < years.length; yi++) {
     const yr = years[yi];
@@ -496,7 +522,21 @@ function auditBalanceSheetIdentity(ticker, sheets) {
       continue;
     }
 
-    const mezz = mezzanineRows.reduce((acc, mr) => acc + (mr.values[yi] ?? 0), 0);
+    let mezz = mezzanineRows.reduce((acc, mr) => acc + (mr.values[yi] ?? 0), 0);
+    if (
+      Math.abs(liab + mezz + equity - assets) > BS_IDENTITY_TOLERANCE &&
+      liabAndEq !== null &&
+      Math.abs(liabAndEq - assets) <= BS_IDENTITY_TOLERANCE &&
+      positionalMezzRows.length > 0
+    ) {
+      const posMezz = positionalMezzRows.reduce((acc, r) => acc + (r.values[yi] ?? 0), 0);
+      if (
+        posMezz !== 0 &&
+        Math.abs(liab + mezz + posMezz + equity - assets) <= BS_IDENTITY_TOLERANCE
+      ) {
+        mezz += posMezz;
+      }
+    }
     const sumLE = liab + mezz + equity;
     const diff = sumLE - assets;
     if (Math.abs(diff) > BS_IDENTITY_TOLERANCE) {
@@ -882,12 +922,16 @@ function auditMajorSubtotals(ticker, sheets) {
         });
       }
 
-      const ncaIdx = findIdx(
-        bsRows,
-        '[비유동자산 합계]',
-        /^\[?비유동자산\s*합계\]?$|^total non-?current assets$/i,
-        /기타비유동자산/
-      );
+      const ncaIdx = (() => {
+        const exact = bsRows.findIndex((r) => r.label === '[비유동자산 합계]');
+        if (exact !== -1) return exact;
+        return bsRows.findIndex(
+          (r) =>
+            (r.isBold || /^\[.*\]$/.test(r.label)) &&
+            /^\[?비유동자산\s*합계\]?$|^total non-?current assets$/i.test(r.label) &&
+            !/기타비유동자산/.test(r.label)
+        );
+      })();
       if (ncaIdx !== -1 && caIdx !== -1 && ncaIdx > caIdx) {
         let ncaStart = caIdx + 1;
         const assetsIdx = bsRows.findIndex(
@@ -1287,9 +1331,13 @@ function auditScaleJumps(ticker, sheets) {
     if (!sheet) continue;
     const { years, rows } = sheet;
 
-    let scanRows = rows;
+    let maxScanRowIdx = rows.length;
     let invIdx = -1;
-    let invStart = 0;
+    let invStart = -1;
+    let finIdx = -1;
+    let finStart = -1;
+    const invReconciles = years.map(() => false);
+    const finReconciles = years.map(() => false);
     if (sheetName === '현금흐름표') {
       const findCfIdx = (exact, re) => {
         const e = rows.findIndex((r) => r.label === exact);
@@ -1297,45 +1345,51 @@ function auditScaleJumps(ticker, sheets) {
       };
       const opIdx = findCfIdx('[영업활동현금흐름]', /영업활동\s*현금흐름|net cash.*operating activities/i);
       invIdx = findCfIdx('[투자활동현금흐름]', /투자활동\s*현금흐름|net cash.*investing activities/i);
-      const finIdx = findCfIdx('[재무활동현금흐름]', /재무활동\s*현금흐름|net cash.*financing activities/i);
+      finIdx = findCfIdx('[재무활동현금흐름]', /재무활동\s*현금흐름|net cash.*financing activities/i);
       const sorted = [opIdx, invIdx, finIdx].filter((x) => x !== -1).sort((a, b) => a - b);
+      const checkCfSecReconcile = (secStart, secIdx, outArr) => {
+        if (secIdx === -1) return;
+        const comps = rows.slice(secStart + 1, secIdx).filter((r) => !/^\[.*\]$/.test(r.label));
+        const secTol = Math.max(3, Math.ceil((comps.length + 1) * 0.5));
+        for (let yi = 0; yi < years.length; yi++) {
+          const tv = rows[secIdx].values[yi];
+          if (tv === null || !comps.some((c) => c.values[yi] !== null)) continue;
+          const sum = comps.reduce((acc, c) => acc + (c.values[yi] ?? 0), 0);
+          if (Math.abs(sum - tv) <= secTol) outArr[yi] = true;
+        }
+      };
       if (invIdx !== -1) {
         for (const s of sorted) {
-          if (s < invIdx) invStart = s + 1;
+          if (s < invIdx) invStart = s;
         }
+        checkCfSecReconcile(invStart, invIdx, invReconciles);
+      }
+      if (finIdx !== -1) {
+        for (const s of sorted) {
+          if (s < finIdx) finStart = s;
+        }
+        checkCfSecReconcile(finStart, finIdx, finReconciles);
       }
       const lastAct = Math.max(opIdx, invIdx, finIdx);
-      if (lastAct !== -1) scanRows = rows.slice(0, lastAct + 1);
+      if (lastAct !== -1) maxScanRowIdx = lastAct + 1;
     }
 
-    for (const row of scanRows) {
-      const isMaEventRow =
-        sheetName === '현금흐름표' &&
-        /기업인수로\s*인한\s*현금유출|사업매각으로\s*인한\s*현금유입|business\s+acquisitions?|acquisitions?,?\s*net\s+of\s+cash/i.test(
-          row.label
-        );
+    for (let rIdx = 0; rIdx < maxScanRowIdx; rIdx++) {
+      const row = rows[rIdx];
+      const inInvSec = sheetName === '현금흐름표' && invIdx !== -1 && rIdx > invStart && rIdx < invIdx;
+      const inFinSec = sheetName === '현금흐름표' && finIdx !== -1 && rIdx > finStart && rIdx < finIdx;
       for (let i = 1; i < years.length; i++) {
         const prev = row.values[i - 1];
         const curr = row.values[i];
         if (prev === null || curr === null || prev === 0 || curr === 0) continue;
+        if (inInvSec && invReconciles[i - 1] && invReconciles[i]) continue;
+        if (inFinSec && finReconciles[i - 1] && finReconciles[i]) continue;
 
         const maxAbs = Math.max(Math.abs(prev), Math.abs(curr));
         const minAbs = Math.min(Math.abs(prev), Math.abs(curr));
         const ratio = maxAbs / minAbs;
 
         if (ratio >= SCALE_JUMP_THRESHOLD && (minAbs >= 5 || maxAbs >= 100000)) {
-          if (isMaEventRow && invIdx !== -1) {
-            const invCompRows = rows.slice(invStart, invIdx).filter((r) => !/^\[.*\]$/.test(r.label));
-            const invOkForYear = (yi) => {
-              const subV = rows[invIdx].values[yi];
-              const comps = invCompRows.map((r) => r.values[yi]).filter((v) => v !== null && v !== undefined);
-              if (subV === null || comps.length === 0) return false;
-              const sum = comps.reduce((a, b) => a + b, 0);
-              const tol = Math.max(3, Math.ceil((comps.length + 1) * 0.5));
-              return Math.abs(sum - subV) <= tol;
-            };
-            if (invOkForYear(i - 1) && invOkForYear(i)) continue;
-          }
           failures.push(
             makeFailure(
               ticker,

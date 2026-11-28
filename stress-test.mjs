@@ -687,6 +687,32 @@ function auditBalanceSheetIdentity(ticker, sheets) {
     return { status: 'FAIL', failures, checkedYears: 0 };
   }
 
+  const positionalMezzRows = [];
+  const liabRowIdxForMezz = rows.indexOf(liabRow);
+  const eqRowIdxForMezz = rows.indexOf(equityRow);
+  if (liabRowIdxForMezz !== -1 && eqRowIdxForMezz > liabRowIdxForMezz + 1) {
+    for (let i = liabRowIdxForMezz + 1; i < eqRowIdxForMezz; i++) {
+      const lbl = rows[i].label;
+      if (
+        /^(?:보통주|우선주|자본금|자본잉여금|이익잉여금|결손금|기타포괄|자기주식|지배기업|비지배|\[\[자본총계\]\])/i.test(
+          lbl
+        ) &&
+        !/상환가능|메자닌|임시자본|redeemable|temporary/i.test(lbl) &&
+        !/주식수|shares/i.test(lbl)
+      ) {
+        break;
+      }
+      if (
+        !rows[i].isBold &&
+        !/^\[.*\]$/.test(lbl) &&
+        !mezzanineRows.includes(rows[i]) &&
+        !/주식수|shares/i.test(lbl)
+      ) {
+        positionalMezzRows.push(rows[i]);
+      }
+    }
+  }
+
   let checkedYears = 0;
   for (let yi = 0; yi < years.length; yi++) {
     const yr = years[yi];
@@ -714,7 +740,21 @@ function auditBalanceSheetIdentity(ticker, sheets) {
       continue;
     }
 
-    const mezz = mezzanineRows.reduce((acc, mr) => acc + (mr.values[yi] ?? 0), 0);
+    let mezz = mezzanineRows.reduce((acc, mr) => acc + (mr.values[yi] ?? 0), 0);
+    if (
+      Math.abs(liab + mezz + equity - assets) > BS_IDENTITY_TOLERANCE &&
+      liabAndEq !== null &&
+      Math.abs(liabAndEq - assets) <= BS_IDENTITY_TOLERANCE &&
+      positionalMezzRows.length > 0
+    ) {
+      const posMezz = positionalMezzRows.reduce((acc, r) => acc + (r.values[yi] ?? 0), 0);
+      if (
+        posMezz !== 0 &&
+        Math.abs(liab + mezz + posMezz + equity - assets) <= BS_IDENTITY_TOLERANCE
+      ) {
+        mezz += posMezz;
+      }
+    }
     const sumLE = liab + mezz + equity;
     const diff = sumLE - assets;
     if (Math.abs(diff) > BS_IDENTITY_TOLERANCE) {
@@ -1098,11 +1138,15 @@ function auditMajorSubtotals(ticker, sheets) {
         });
       }
 
-      const ncaIdx = findIdx(
-        bsRows,
-        '[비유동자산 합계]',
-        /^\[?비유동자산\s*합계\]?$|^total non-?current assets$/i
-      );
+      const ncaIdx = (() => {
+        const exact = bsRows.findIndex((r) => r.label === '[비유동자산 합계]');
+        if (exact !== -1) return exact;
+        return bsRows.findIndex(
+          (r) =>
+            (r.isBold || /^\[.*\]$/.test(r.label)) &&
+            /^\[?비유동자산\s*합계\]?$|^total non-?current assets$/i.test(r.label)
+        );
+      })();
       if (ncaIdx !== -1 && caIdx !== -1 && ncaIdx > caIdx) {
         let ncaStart = caIdx + 1;
         const assetsIdx = bsRows.findIndex(
@@ -1514,46 +1558,55 @@ function auditScaleJumps(ticker, sheets) {
     let maxScanRowIdx = rows.length;
     let invStart = -1;
     let invIdx = -1;
+    let finStart = -1;
+    let finIdx = -1;
     const invReconciles = years.map(() => false);
+    const finReconciles = years.map(() => false);
     if (sheetName === '현금흐름표') {
-      const actIndices = rows
-        .map((r, idx) => (/^\[(?:영업|투자|재무)활동현금흐름\]$/.test(r.label) ? idx : -1))
-        .filter((x) => x >= 0);
+      const findCfActIdx = (exact, re) => {
+        const e = rows.findIndex((r) => r.label === exact);
+        return e !== -1 ? e : rows.findIndex((r) => re.test(r.label));
+      };
+      const opIdx = findCfActIdx('[영업활동현금흐름]', /영업활동\s*현금흐름|net cash.*operating activities/i);
+      invIdx = findCfActIdx('[투자활동현금흐름]', /투자활동\s*현금흐름|net cash.*investing activities/i);
+      finIdx = findCfActIdx('[재무활동현금흐름]', /재무활동\s*현금흐름|net cash.*financing activities/i);
+      const actIndices = [opIdx, invIdx, finIdx].filter((x) => x >= 0).sort((a, b) => a - b);
       if (actIndices.length > 0) maxScanRowIdx = Math.max(...actIndices);
-      invIdx = rows.findIndex((r) => r.label === '[투자활동현금흐름]');
-      if (invIdx !== -1) {
-        for (let k = invIdx - 1; k >= 0; k--) {
-          if (/^\[(?:영업|투자|재무)활동현금흐름\]$/.test(rows[k].label)) {
-            invStart = k;
-            break;
-          }
-        }
-        const invComps = rows.slice(invStart + 1, invIdx).filter((r) => !/^\[.*\]$/.test(r.label));
-        const invTol = Math.max(3, Math.ceil((invComps.length + 1) * 0.5));
+      const checkCfSecReconcile = (secStart, secIdx, outArr) => {
+        if (secIdx === -1) return;
+        const comps = rows.slice(secStart + 1, secIdx).filter((r) => !/^\[.*\]$/.test(r.label));
+        const secTol = Math.max(3, Math.ceil((comps.length + 1) * 0.5));
         for (let yi = 0; yi < years.length; yi++) {
-          const tv = rows[invIdx].values[yi];
-          if (tv === null || !invComps.some((c) => c.values[yi] !== null)) continue;
-          const sum = invComps.reduce((acc, c) => acc + (c.values[yi] ?? 0), 0);
-          if (Math.abs(sum - tv) <= invTol) invReconciles[yi] = true;
+          const tv = rows[secIdx].values[yi];
+          if (tv === null || !comps.some((c) => c.values[yi] !== null)) continue;
+          const sum = comps.reduce((acc, c) => acc + (c.values[yi] ?? 0), 0);
+          if (Math.abs(sum - tv) <= secTol) outArr[yi] = true;
         }
+      };
+      if (invIdx !== -1) {
+        for (const s of actIndices) {
+          if (s < invIdx) invStart = s;
+        }
+        checkCfSecReconcile(invStart, invIdx, invReconciles);
+      }
+      if (finIdx !== -1) {
+        for (const s of actIndices) {
+          if (s < finIdx) finStart = s;
+        }
+        checkCfSecReconcile(finStart, finIdx, finReconciles);
       }
     }
 
     for (let rIdx = 0; rIdx < maxScanRowIdx; rIdx++) {
       const row = rows[rIdx];
-      const isInvMaRow =
-        sheetName === '현금흐름표' &&
-        invIdx !== -1 &&
-        rIdx > invStart &&
-        rIdx < invIdx &&
-        /기업인수|사업인수|매각|처분|인수.*현금|acquisitions?|divestitures?|business\s+combination|sale\s+of\s+business/i.test(
-          row.label
-        );
+      const inInvSec = sheetName === '현금흐름표' && invIdx !== -1 && rIdx > invStart && rIdx < invIdx;
+      const inFinSec = sheetName === '현금흐름표' && finIdx !== -1 && rIdx > finStart && rIdx < finIdx;
       for (let i = 1; i < years.length; i++) {
         const prev = row.values[i - 1];
         const curr = row.values[i];
         if (prev === null || curr === null || prev === 0 || curr === 0) continue;
-        if (isInvMaRow && invReconciles[i - 1] && invReconciles[i]) continue;
+        if (inInvSec && invReconciles[i - 1] && invReconciles[i]) continue;
+        if (inFinSec && finReconciles[i - 1] && finReconciles[i]) continue;
 
         const maxAbs = Math.max(Math.abs(prev), Math.abs(curr));
         const minAbs = Math.min(Math.abs(prev), Math.abs(curr));
@@ -2924,10 +2977,29 @@ function auditSecGroundTruth(ticker, sheets, capture) {
         const lVal = getLiabAt(yi);
         if (aVal !== null && aVal !== undefined && lVal !== null && lVal !== undefined) {
           const impliedTotalEq = aVal - lVal;
+          const secAssetsForYr = getSecAnnualFactBest(factsObj, ['Assets'], yr, true, fyeMonth);
           const scored = allEqTags
-            .map((t) => ({ tag: t, fact: getSecAnnualFactValueForTag(factsObj, t, yr, true, fyeMonth) }))
-            .filter((x) => x.fact)
-            .sort((a, b) => Math.abs(a.fact.valM - impliedTotalEq) - Math.abs(b.fact.valM - impliedTotalEq));
+            .map((t) => {
+              const fact = getSecAnnualFactValueForTag(factsObj, t, yr, true, fyeMonth);
+              if (!fact) return null;
+              let effValM = fact.valM;
+              if (
+                secAssetsForYr?.filed &&
+                fact.filed &&
+                fact.filed > secAssetsForYr.filed &&
+                Array.isArray(fact.allRecords)
+              ) {
+                const bsAligned = fact.allRecords.filter(
+                  (r) => r.filed && r.filed <= secAssetsForYr.filed
+                );
+                if (bsAligned.length > 0) {
+                  effValM = bsAligned[bsAligned.length - 1].valM;
+                }
+              }
+              return { tag: t, fact, effValM };
+            })
+            .filter(Boolean)
+            .sort((a, b) => Math.abs(a.effValM - impliedTotalEq) - Math.abs(b.effValM - impliedTotalEq));
           if (scored.length > 0) {
             const ordered = scored.map((x) => x.tag);
             for (const t of allEqTags) {
@@ -3219,7 +3291,27 @@ function auditSecGroundTruth(ticker, sheets, capture) {
               Math.abs(excelVal - r.valM) <= Math.max(2, Math.abs(r.valM) * 0.005)
           );
         });
-      const isOk = absDiff <= tol || matchesPrior10K || matchesAltEquityTag;
+      let matchesContDiscOcf = false;
+      if (absDiff > tol && m.metric === '영업활동현금흐름' && cf) {
+        const discOcfRow = cf.rows.find((r) =>
+          /중단영업.*영업활동|영업활동.*중단영업|operating.*discontinued/i.test(r.label)
+        );
+        const discVal = discOcfRow && sheetYi >= 0 ? discOcfRow.values[sheetYi] : null;
+        if (typeof discVal === 'number' && discVal !== 0) {
+          if (Math.abs(excelVal + discVal - secValM) <= tol) {
+            matchesContDiscOcf = true;
+          } else if (Array.isArray(secFact.allCandidates)) {
+            const contCand = secFact.allCandidates.find(
+              (alt) =>
+                alt &&
+                alt.tag === 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations' &&
+                Math.abs(excelVal - alt.valM) <= Math.max(2, Math.abs(alt.valM) * 0.005)
+            );
+            if (contCand) matchesContDiscOcf = true;
+          }
+        }
+      }
+      const isOk = absDiff <= tol || matchesPrior10K || matchesAltEquityTag || matchesContDiscOcf;
       if (!isOk) {
         const pct = secValM !== 0 ? ((diff / Math.abs(secValM)) * 100).toFixed(2) : 'inf';
         failures.push(
@@ -3245,6 +3337,8 @@ function auditSecGroundTruth(ticker, sheets, capture) {
           ? `${secFact.tag} (원공시일치)`
           : matchesAltEquityTag
           ? `${secFact.tag} (후속10-K재작성기준)`
+          : matchesContDiscOcf
+          ? `${secFact.tag} (계속+중단영업 합산일치)`
           : `${secFact.tag}${effectiveSecTagNote}`,
         secValM: secValRounded,
         diff: Number(diff.toFixed(1)),
@@ -3582,6 +3676,8 @@ const KOR_LABEL_TAG_HINTS = [
   [/^영업권$/, /^Goodwill$/],
   [/^무형자산/, /IntangibleAssets/i],
   [/^매입채무/, /AccountsPayable/i],
+  [/^보통주자본금$/, /^CommonStockValue$/],
+  [/^우선주자본금$/, /^PreferredStockValue$/],
   [/^이익잉여금|^결손금/, /RetainedEarnings/i],
   [/^자기주식/, /TreasuryStock/i],
   [/^감가상각비/, /Depreciation/i],
@@ -3661,6 +3757,15 @@ function buildTranslationMappings(sheets, capture) {
         if (/기초 현금/.test(korName) && /beginning/i.test(cand.engLabel)) score += 15;
         if (/기말 현금/.test(korName) && /end/i.test(cand.engLabel)) score += 15;
         if (!usedCandIndices.has(ci)) score += 2;
+        if (
+          stmtType === 'BS' &&
+          !/주식수|발행주식|shares/i.test(korName) &&
+          /(?:SharesAuthorized|SharesIssued|SharesOutstanding|ParOrStatedValuePerShare|TreasuryStock(?:Common|Preferred)?Shares)$/i.test(
+            cand.tag || ''
+          )
+        ) {
+          score -= 40;
+        }
 
         if (score > matchedScore && exactNumMatches + absNumMatches > 0 && numMismatches === 0) {
           matchedScore = score;
