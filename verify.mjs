@@ -1443,7 +1443,6 @@ function auditCashOutflowSigns(ticker, sheets) {
       if (val !== null && val > 0) {
         if (
           /^기업인수로\s*인한\s*현금유출$/i.test(row.label) &&
-          row.values.some((v) => v !== null && v < 0) &&
           invIdx !== -1
         ) {
           const invCompRows = rows.slice(invStart, invIdx).filter((r) => !/^\[.*\]$/.test(r.label));
@@ -1454,7 +1453,12 @@ function auditCashOutflowSigns(ticker, sheets) {
           if (invSubVal !== null && invCompVals.length > 0) {
             const invSum = invCompVals.reduce((a, b) => a + b, 0);
             const invTol = Math.max(3, Math.ceil((invCompVals.length + 1) * 0.5));
-            if (Math.abs(invSum - invSubVal) <= invTol && Math.abs(invSum - 2 * val - invSubVal) > invTol) {
+            if (
+              Math.abs(invSum - invSubVal) <= invTol &&
+              (Math.abs(invSum - 2 * val - invSubVal) > invTol ||
+                (Math.abs(invSum - invSubVal) <= 1 &&
+                  Math.abs(invSum - 2 * val - invSubVal) > Math.abs(invSum - invSubVal) + 1))
+            ) {
               continue;
             }
           }
@@ -2304,7 +2308,7 @@ function auditStructuralAnomalies(ticker, sheets) {
     );
   const isEpsOrShares = (lbl) => /주당순이익|발행주식수|주식수/i.test(lbl);
   const isIsCoreSummary = (lbl) =>
-    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|포괄손익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손익/i.test(
+    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|총포괄손실|포괄손익|포괄손실)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손(?:익|실)|comprehensive\s+(?:income|loss)|비지배지분.*(?:순이익|순손실|손익)/i.test(
       lbl
     );
   const isSoleActiveComponentOfSubtotal = (rows, idxA, idxB, matchedYearIndices, yearsLength) => {

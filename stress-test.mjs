@@ -1391,25 +1391,34 @@ function auditMajorSubtotals(ticker, sheets) {
         const rawSlice = cfRows.slice(effectiveOpStart, opIdx);
         const skippedInterm = new Set();
         for (let i = 1; i < rawSlice.length; i++) {
-          if (isExcludedOpRow(rawSlice[i].label)) continue;
-          const prevItems = [];
-          for (let j = 1; j < i; j++) {
-            if (!isExcludedOpRow(rawSlice[j].label) && !skippedInterm.has(j)) {
-              prevItems.push(rawSlice[j]);
+          const cand = rawSlice[i];
+          if (isExcludedOpRow(cand.label)) continue;
+          const mightBeIntermSub =
+            cand.isBold ||
+            /운전자본.*(?:변동전|순증감|합계)|before\s+changes\s+in\s+(?:operating|working)/i.test(
+              cand.label
+            );
+          if (!mightBeIntermSub) continue;
+          for (let start = 0; start < i; start++) {
+            const slice = rawSlice
+              .slice(start, i)
+              .filter((_, idxRel) => !skippedInterm.has(start + idxRel) && !isExcludedOpRow(rawSlice[start + idxRel].label));
+            if (slice.length < 2) continue;
+            const tol = Math.max(3, Math.ceil((slice.length + 1) * 0.5));
+            let okCnt = 0;
+            let totCnt = 0;
+            for (let yi = 0; yi < cfYears.length; yi++) {
+              const tv = cand.values[yi];
+              if (tv === null) continue;
+              totCnt++;
+              const s = slice.reduce((acc, p) => acc + (p.values[yi] ?? 0), 0);
+              if (Math.abs(s - tv) <= tol) okCnt++;
+            }
+            if (totCnt > 0 && okCnt === totCnt) {
+              skippedInterm.add(i);
+              break;
             }
           }
-          if (prevItems.length < 2) continue;
-          let okCnt = 0;
-          let totCnt = 0;
-          const tol = Math.max(3, Math.ceil((prevItems.length + 1) * 0.5));
-          for (let yi = 0; yi < cfYears.length; yi++) {
-            const tv = rawSlice[i].values[yi];
-            if (tv === null || tv === 0 || !prevItems.some((p) => p.values[yi] !== null)) continue;
-            totCnt++;
-            const s = prevItems.reduce((acc, p) => acc + (p.values[yi] ?? 0), 0);
-            if (Math.abs(s - tv) <= tol) okCnt++;
-          }
-          if (totCnt >= 2 && okCnt / totCnt >= 0.8) skippedInterm.add(i);
         }
         opCompRows = rawSlice.filter((r, idx) => !isExcludedOpRow(r.label) && !skippedInterm.has(idx));
       } else {
@@ -1658,7 +1667,6 @@ function auditCashOutflowSigns(ticker, sheets) {
       if (val !== null && val > 0) {
         if (
           /^기업인수로\s*인한\s*현금유출$/i.test(row.label) &&
-          row.values.some((v) => v !== null && v < 0) &&
           invIdx !== -1
         ) {
           const invCompRows = rows.slice(invStart, invIdx).filter((r) => !/^\[.*\]$/.test(r.label));
@@ -1671,7 +1679,9 @@ function auditCashOutflowSigns(ticker, sheets) {
             const invTol = Math.max(3, Math.ceil((invCompVals.length + 1) * 0.5));
             if (
               Math.abs(invSum - invSubVal) <= invTol &&
-              Math.abs(invSum - 2 * val - invSubVal) > invTol
+              (Math.abs(invSum - 2 * val - invSubVal) > invTol ||
+                (Math.abs(invSum - invSubVal) <= 1 &&
+                  Math.abs(invSum - 2 * val - invSubVal) > Math.abs(invSum - invSubVal) + 1))
             ) {
               continue;
             }
@@ -2445,6 +2455,7 @@ function getSecAnnualFactBest(factsObj, tagCandidates, targetYear, isInstant, fy
       if (newerRestated.length > 0 && newerRestated[0] !== primary) {
         return {
           ...newerRestated[0],
+          allCandidates: foundList,
           allCandidateValuesM: foundList.flatMap((c) => c.allValuesM),
           allCandidateRecords: foundList.flatMap((c) => c.allRecords || []),
         };
@@ -2453,6 +2464,7 @@ function getSecAnnualFactBest(factsObj, tagCandidates, targetYear, isInstant, fy
     if (bestNonZeroRev && Math.abs(primary.valM) === 0) {
       return {
         ...bestNonZeroRev,
+        allCandidates: foundList,
         allCandidateValuesM: foundList.flatMap((c) => c.allValuesM),
         allCandidateRecords: foundList.flatMap((c) => c.allRecords || []),
       };
@@ -2467,12 +2479,13 @@ function getSecAnnualFactBest(factsObj, tagCandidates, targetYear, isInstant, fy
     ) {
       return {
         ...maxItem,
+        allCandidates: foundList,
         allCandidateValuesM: foundList.flatMap((c) => c.allValuesM),
         allCandidateRecords: foundList.flatMap((c) => c.allRecords || []),
       };
     }
   }
-  return primary;
+  return foundList.length > 1 ? { ...primary, allCandidates: foundList } : primary;
 }
 
 // [신규 감사 A·B] 동일 시트 다개년 동일 수치 중복 행 탐지 & BS 주식수(sharesItemType) 혼입 탐지
@@ -2490,7 +2503,7 @@ function auditStructuralAnomalies(ticker, sheets, translations = null) {
     );
   const isEpsOrShares = (lbl) => /주당순이익|발행주식수|주식수/i.test(lbl);
   const isIsCoreSummary = (lbl) =>
-    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|포괄손익)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손익/i.test(
+    /^(?:매출액|영업수익|매출총이익|영업이익|법인세비용차감전순이익|계속영업순이익|연결당기순이익|당기순이익|보통주귀속당기순이익|총포괄손익|총포괄손실|포괄손익|포괄손실)$|보통주.*(?:기본|희석).*순이익|희석\s*(?:당기)?순이익|포괄손(?:익|실)|comprehensive\s+(?:income|loss)|비지배지분.*(?:순이익|순손실|손익)/i.test(
       lbl
     );
   const isSoleActiveComponentOfSubtotal = (rows, idxA, idxB, matchedYearIndices, yearsLength) => {
@@ -3056,11 +3069,71 @@ function auditSecGroundTruth(ticker, sheets, capture) {
           }
         }
       }
+      if (
+        m.metric === '매출액' &&
+        excelVal !== null &&
+        Math.abs(excelVal - effectiveSecValM) > Math.max(2, Math.abs(effectiveSecValM) * 0.005) &&
+        Array.isArray(secFact.allCandidates) &&
+        capture?.rHtmlEntries?.length
+      ) {
+        const isEntries = capture.rHtmlEntries
+          .filter((e) => capture.filingSummaries?.get(e.accNoDashes)?.IS === e.htmlFile)
+          .map((e) => {
+            const hdrPart = (e.html.split(/<td[^>]*class=["']nump?["']/i)[0] || e.html.slice(0, 5000))
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/&nbsp;|&#160;/gi, ' ');
+            const hdrYrs = [...hdrPart.matchAll(/\b(20\d{2})\b/g)].map((x) => parseInt(x[1], 10));
+            return {
+              ...e,
+              hasYr: hdrYrs.includes(Number(yr)),
+              maxHdrYr: hdrYrs.length > 0 ? Math.max(...hdrYrs) : 0,
+            };
+          })
+          .filter((e) => e.hasYr)
+          .sort((a, b) => b.maxHdrYr - a.maxHdrYr || b.accNoDashes.localeCompare(a.accNoDashes));
+        if (isEntries.length > 0) {
+          const bodyHtml = isEntries[0].html.split(/class=["']authRefData/i)[0] || isEntries[0].html;
+          const isYrTags = new Set(
+            [...bodyHtml.matchAll(/defref_us-gaap_([A-Za-z0-9]+)/gi)].map((x) => x[1])
+          );
+          if (isYrTags.size > 0 && !isYrTags.has(secFact.tag)) {
+            const altMatch = secFact.allCandidates.find(
+              (alt) =>
+                alt &&
+                isYrTags.has(alt.tag) &&
+                Math.abs(excelVal - alt.valM) <= Math.max(2, Math.abs(alt.valM) * 0.005)
+            );
+            if (altMatch) {
+              secFact = altMatch;
+              effectiveSecValM = altMatch.valM;
+              effectiveSecTagNote = ' (IS본문태그기준)';
+            }
+          }
+        }
+      }
       const secValM = effectiveSecValM;
       const secValRounded = Number(secValM.toFixed(1));
       const tol = Math.max(2, Math.abs(secValM) * 0.005);
 
       if (excelVal === null) {
+        if (
+          m.metric === '자산총계' &&
+          fyeMonth !== null &&
+          secFact.end &&
+          circularMonthDiff(parseInt(secFact.end.slice(5, 7), 10), fyeMonth) > 1
+        ) {
+          comparisons.push({
+            metric: m.metric,
+            year: String(yr),
+            excelLabel: m.excelRow.label,
+            excelVal: null,
+            secTag: '(BS 미공시 N/A)',
+            secValM: null,
+            diff: null,
+            status: 'N/A',
+          });
+          continue;
+        }
         if (m.metric === '자본총계') {
           const excelAssetsVal =
             sheetYi >= 0 && assetsRow ? assetsRow.values[sheetYi] : null;
@@ -3071,7 +3144,13 @@ function auditSecGroundTruth(ticker, sheets, capture) {
             true,
             fyeMonth
           );
-          if (excelAssetsVal === null && !secAssetsFact) {
+          const hasFyeSecAssets = Boolean(
+            secAssetsFact &&
+              (!fyeMonth ||
+                !secAssetsFact.end ||
+                circularMonthDiff(parseInt(secAssetsFact.end.slice(5, 7), 10), fyeMonth) <= 1)
+          );
+          if (excelAssetsVal === null && !hasFyeSecAssets) {
             comparisons.push({
               metric: m.metric,
               year: String(yr),
@@ -3122,7 +3201,25 @@ function auditSecGroundTruth(ticker, sheets, capture) {
             secFact.allRecords.some(
               (r) => r.form === '10-K' && Math.abs(excelVal - r.valM) <= Math.max(2, Math.abs(r.valM) * 0.005)
             )));
-      const isOk = absDiff <= tol || matchesPrior10K;
+      const matchesAltEquityTag =
+        absDiff > tol &&
+        m.metric === '자본총계' &&
+        Array.isArray(secFact.allCandidates) &&
+        secFact.allCandidates.some((alt) => {
+          if (!alt || alt.tag === secFact.tag) return false;
+          const recs =
+            Array.isArray(alt.allRecords) && alt.allRecords.length > 0
+              ? alt.allRecords
+              : [{ valM: alt.valM, form: alt.form || '10-K' }];
+          return recs.some(
+            (r) =>
+              /10-K/.test(r.form || '') &&
+              secValM !== 0 &&
+              Math.abs(r.valM - secValM) / Math.abs(secValM) <= 0.02 &&
+              Math.abs(excelVal - r.valM) <= Math.max(2, Math.abs(r.valM) * 0.005)
+          );
+        });
+      const isOk = absDiff <= tol || matchesPrior10K || matchesAltEquityTag;
       if (!isOk) {
         const pct = secValM !== 0 ? ((diff / Math.abs(secValM)) * 100).toFixed(2) : 'inf';
         failures.push(
@@ -3146,6 +3243,8 @@ function auditSecGroundTruth(ticker, sheets, capture) {
         excelVal,
         secTag: matchesPrior10K
           ? `${secFact.tag} (원공시일치)`
+          : matchesAltEquityTag
+          ? `${secFact.tag} (후속10-K재작성기준)`
           : `${secFact.tag}${effectiveSecTagNote}`,
         secValM: secValRounded,
         diff: Number(diff.toFixed(1)),

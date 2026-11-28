@@ -1806,6 +1806,31 @@ function autoFixRowSignsBySubtotalReconciliation(rows, targetYears, stmtType) {
           continue;
         }
 
+        if (stmtType === 'CF' && prevTotalIdx === -1 && yrStartIdx >= 0 && yrStartIdx < sIdx) {
+          const startRow = rows[yrStartIdx];
+          const startVal = startRow?.rValuesByYear?.[y];
+          const startRawLbl = String(startRow?.companyLabel || startRow?.contextualLabel || '');
+          const isExplicitLossOnlyLabel =
+            /^\s*(?:net|consolidated)\s+loss(?:es)?\b/i.test(startRawLbl) &&
+            !/\b(?:income|earnings|profit)\b/i.test(startRawLbl);
+          if (
+            startRow &&
+            [
+              'ProfitLoss',
+              'NetIncomeLoss',
+              'IncomeLossFromContinuingOperations',
+              'IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest',
+            ].includes(startRow.tag) &&
+            typeof startVal === 'number' &&
+            startVal > 0 &&
+            isExplicitLossOnlyLabel &&
+            Math.abs(currentSum - 2 * startVal - subVal) <= 3
+          ) {
+            startRow.rValuesByYear[y] = -startVal;
+            continue;
+          }
+        }
+
         // 영업활동현금흐름에서 처분이익 등 비현금 손익 2개 행이 동시에 반대 부호로 표기된 경우 보정
         if (stmtType === 'CF' && prevTotalIdx === -1) {
           const gainLossCandidates = activeIndices.filter((idx) => {
@@ -2700,14 +2725,28 @@ async function discoverAll10KFilings(cik, factsObj, headers, preloadedSubData = 
 }
 
 // 15. 단일 10-K 공시의 R*.htm 추출 (MSA Safety 버전과 100% 동일하게 고정!)
+async function fetchWithSecRetry(url, fetchOpts, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, fetchOpts);
+      if (res.status !== 429 && res.status < 500) return res;
+      if (attempt === maxAttempts) return res;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+    }
+    await delay(600 * attempt);
+  }
+  return null;
+}
+
 async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj, headers) {
   try {
     const accNoDashes = accessionNumber.replace(/-/g, '');
     const baseArchivePath = `Archives/edgar/data/${cikUnpadded}/${accNoDashes}`;
 
     const summaryUrl = makeUrl(['www', 'sec', 'gov'], `${baseArchivePath}/FilingSummary.xml`);
-    const summaryRes = await fetch(summaryUrl, { headers });
-    if (!summaryRes.ok) return null;
+    const summaryRes = await fetchWithSecRetry(summaryUrl, { headers });
+    if (!summaryRes || !summaryRes.ok) return null;
 
     const summaryXml = await summaryRes.text();
     const reportBlocks = summaryXml.match(/<Report[\s\S]*?<\/Report>/gi) || [];
@@ -2769,8 +2808,8 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
     const parseRHtmlTable = async (htmlFile, stmtType) => {
       if (!htmlFile) return [];
       const rUrl = makeUrl(['www', 'sec', 'gov'], `${baseArchivePath}/${htmlFile}`);
-      const rRes = await fetch(rUrl, { headers });
-      if (!rRes.ok) return [];
+      const rRes = await fetchWithSecRetry(rUrl, { headers });
+      if (!rRes || !rRes.ok) return [];
 
       const html = await rRes.text();
 
@@ -2862,6 +2901,13 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
       };
 
       const isAnnualDur = (d) => /^(?:12\s*months?|5[23]\s*weeks?)\s*ended$/i.test(d || '');
+      const parseDurMonths = (d) => {
+        const dm = String(d || '').match(/(\d+)\s*months?\s*ended/i);
+        if (dm) return parseInt(dm[1], 10);
+        const wm = String(d || '').match(/(\d+)\s*weeks?\s*ended/i);
+        if (wm) return Math.round((parseInt(wm[1], 10) / 52) * 12);
+        return 0;
+      };
       let colEntries = [];
       const yearRowIdx = headerRows.findLastIndex((r) =>
         r.some((c) => !c.isFootnoteHeader && /\b(20\d{2})\b/.test(c.text))
@@ -2876,15 +2922,18 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
           !prevDataCells.every((p) => p.colspan >= 4) &&
           (prevDataCells.length === yearDataCells.length || prevDataCells.length >= 2);
         const yearCellDurs = yearDataCells.map((c) => durationBySlot[c.slot] || '');
+        const nonEmptyDurCount = yearCellDurs.filter(Boolean).length;
         const hasMixedDurations =
           stmtType !== 'BS' &&
-          yearDataCells.every((c, idx) => !/\b(20\d{2})\b/.test(c.text) || Boolean(yearCellDurs[idx])) &&
+          nonEmptyDurCount >= 2 &&
+          nonEmptyDurCount >= yearDataCells.length - 1 &&
           yearCellDurs.some(isAnnualDur) &&
           yearCellDurs.some((d) => d && !isAnnualDur(d));
 
+        const prelimCols = [];
         for (let c = 0; c < yearDataCells.length; c++) {
           const cell = yearDataCells[c];
-          if (hasMixedDurations && yearCellDurs[c] && !isAnnualDur(yearCellDurs[c])) continue;
+          if (hasMixedDurations && !yearCellDurs[c]) continue;
           let prevText = '';
           if (canUsePrevRow) {
             if (prevDataCells.length === yearDataCells.length) {
@@ -2906,7 +2955,40 @@ async function fetchSingle10KRStatements(cikUnpadded, accessionNumber, factsObj,
             if (/\bJan(?:uary)?\.?\s*(?:0?[1-9]|1[0-5])\b/i.test(fullDateText)) {
               yr -= 1;
             }
-            colEntries.push({ colIdx: c, yr, month: parseHeaderMonth(fullDateText) });
+            const month = parseHeaderMonth(fullDateText);
+            if (hasMixedDurations) {
+              prelimCols.push({
+                colIdx: c,
+                yr,
+                month,
+                durMonths: parseDurMonths(yearCellDurs[c]),
+                isAnnual: isAnnualDur(yearCellDurs[c]),
+              });
+            } else {
+              colEntries.push({ colIdx: c, yr, month });
+            }
+          }
+        }
+        if (hasMixedDurations && prelimCols.length > 0) {
+          const annualYears = new Set(prelimCols.filter((x) => x.isAnnual).map((x) => x.yr));
+          const bestStubByYear = new Map();
+          for (const item of prelimCols) {
+            if (item.isAnnual || annualYears.has(item.yr) || item.durMonths < 7) continue;
+            const prev = bestStubByYear.get(item.yr);
+            if (
+              !prev ||
+              item.durMonths > prev.durMonths ||
+              (item.durMonths === prev.durMonths &&
+                ((item.month || 0) > (prev.month || 0) ||
+                  ((item.month || 0) === (prev.month || 0) && item.colIdx > prev.colIdx)))
+            ) {
+              bestStubByYear.set(item.yr, item);
+            }
+          }
+          for (const item of prelimCols) {
+            if (item.isAnnual || bestStubByYear.get(item.yr) === item) {
+              colEntries.push({ colIdx: item.colIdx, yr: item.yr, month: item.month });
+            }
           }
         }
       }
@@ -7874,13 +7956,37 @@ export async function POST(request) {
                       if ((other.dimMember || '') !== (rRow.dimMember || '')) return false;
                       if (cfSecOfRow(oi) !== mySec) return false;
                       if (other.rValuesByYear?.[y] !== candidateVal) return false;
-                      return targetYears.some(
-                        (oy) =>
-                          oy !== y &&
-                          typeof rRow.rValuesByYear?.[oy] === 'number' &&
-                          rRow.rValuesByYear[oy] !== 0 &&
-                          rRow.rValuesByYear[oy] === other.rValuesByYear?.[oy]
-                      );
+                      if (
+                        targetYears.some(
+                          (oy) =>
+                            oy !== y &&
+                            typeof rRow.rValuesByYear?.[oy] === 'number' &&
+                            rRow.rValuesByYear[oy] !== 0 &&
+                            rRow.rValuesByYear[oy] === other.rValuesByYear?.[oy]
+                        )
+                      ) {
+                        return true;
+                      }
+                      const cfVals = cfSeries?.valuesByYear;
+                      if (cfVals) {
+                        const distinctCrossVals = new Set();
+                        let crossMatches = 0;
+                        for (const oy of targetYears) {
+                          if (oy === y) continue;
+                          const oVal = other.rValuesByYear?.[oy];
+                          const fRaw = cfVals[oy];
+                          if (typeof oVal !== 'number' || oVal === 0 || fRaw === null || fRaw === undefined) {
+                            continue;
+                          }
+                          const fScaled = Math.round(fRaw / 1e6);
+                          if (fScaled === oVal || Math.abs(fScaled) === Math.abs(oVal)) {
+                            crossMatches++;
+                            distinctCrossVals.add(Math.abs(oVal));
+                          }
+                        }
+                        if (crossMatches >= 2 && distinctCrossVals.size >= 2) return true;
+                      }
+                      return false;
                     });
               if (dupSibling) {
                 continue;
@@ -8249,6 +8355,51 @@ export async function POST(request) {
       }
 
       autoFixRowSignsBySubtotalReconciliation(enrichedRows, targetYears, stmtType);
+
+      if (stmtType === 'CF') {
+        const cfNetChangeIdx = enrichedRows.findIndex(
+          (r) =>
+            !r.dimMember &&
+            r.rowType === 'USD' &&
+            (/PeriodIncreaseDecrease/i.test(r.tag || '') ||
+              /현금및현금성자산의\s*순증감/.test(r.exactKor || ''))
+        );
+        if (cfNetChangeIdx > 0) {
+          for (let ri = enrichedRows.length - 1; ri > cfNetChangeIdx; ri--) {
+            const r = enrichedRows[ri];
+            if (
+              r.dimMember ||
+              r.isTotalRow ||
+              r.rowType !== 'USD' ||
+              !r.tag ||
+              /^(?:Cash|RestrictedCash|EffectOfExchangeRate|InterestPaid|IncomeTaxesPaid)/i.test(
+                r.tag
+              )
+            ) {
+              continue;
+            }
+            const hasActivityDup = enrichedRows.some((act, ai) => {
+              if (ai >= cfNetChangeIdx || act.dimMember || act.isTotalRow || act.tag !== r.tag) {
+                return false;
+              }
+              let overlapNonZero = 0;
+              for (const y of targetYears) {
+                const av = act.rValuesByYear?.[y];
+                const rv = r.rValuesByYear?.[y];
+                if (typeof av !== 'number' || typeof rv !== 'number' || (av === 0 && rv === 0)) {
+                  continue;
+                }
+                if (av !== rv) return false;
+                overlapNonZero++;
+              }
+              return overlapNonZero >= 3;
+            });
+            if (hasActivityDup) {
+              enrichedRows.splice(ri, 1);
+            }
+          }
+        }
+      }
 
       if (stmtType === 'IS' && !hasMultiSegSheet) {
         const metaStartIdx = enrichedRows.findIndex(
